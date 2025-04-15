@@ -46,6 +46,8 @@
         qp_man.tx_wq.cons_idx = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
         qp_man.tx_wq.get_head = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
         qp_man.tx_wq.get_tail = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
+        qp_man.rx_wq.resv_head = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
+        qp_man.rx_wq.cons_idx = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
         qp_man.ibuf.head = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                         \
         qp_man.ibuf.tail = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                         \
     } while (0);
@@ -169,13 +171,17 @@ typedef struct {
         uint64_t get_tail;    // last wqe idx + 1 polled with cst; get_tail > get_head is possible
     } tx_wq;
     struct {
+        uint64_t resv_head;   // last reserved wqe idx + 1
+        uint64_t cons_idx;    // polled wqe idx + 1 (consumer index + 1)
+    } rx_wq;
+    struct {
         uint64_t head;
         uint64_t tail;
     } ibuf;
     char padding[NVSHMEMI_IBGDA_QP_MANAGEMENT_PADDING];
 } __attribute__((__aligned__(8))) nvshmemi_ibgda_device_qp_management_v1;
-static_assert(sizeof(nvshmemi_ibgda_device_qp_management_v1) == 96,
-              "ibgda_device_qp_management_v1 must be 96 bytes.");
+static_assert(sizeof(nvshmemi_ibgda_device_qp_management_v1) == 112,
+              "ibgda_device_qp_management_v1 must be 104 bytes.");
 
 typedef nvshmemi_ibgda_device_qp_management_v1 nvshmemi_ibgda_device_qp_management_t;
 
@@ -199,9 +205,19 @@ typedef struct nvshmemi_ibgda_device_qp {
         // May point to mvars.prod_idx or internal prod_idx
         uint64_t *prod_idx;
     } tx_wq;
+    struct {
+        uint16_t nwqes;
+        uint64_t tail;
+        void *wqe;
+        __be32 *dbrec;
+        void *bf;
+        nvshmemi_ibgda_device_cq_t *cq;
+        // May point to mvars.prod_idx or internal prod_idx
+        uint64_t *prod_idx;
+    } rx_wq;
     nvshmemi_ibgda_device_qp_management_v1 mvars;  // management variables
 } nvshmemi_ibgda_device_qp_v1;
-static_assert(sizeof(nvshmemi_ibgda_device_qp_v1) == 184, "ibgda_device_qp_v1 must be 184 bytes.");
+static_assert(sizeof(nvshmemi_ibgda_device_qp_v1) == 256, "ibgda_device_qp_v1 must be 256 bytes.");
 
 typedef nvshmemi_ibgda_device_qp_v1 nvshmemi_ibgda_device_qp_t;
 
