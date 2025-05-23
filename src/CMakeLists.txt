@@ -426,6 +426,7 @@ endif()
 
 if(NVSHMEM_IBDEVX_SUPPORT OR NVSHMEM_IBGDA_SUPPORT)
   find_library(MLX5_lib NAMES mlx5)
+  find_library(BNXT_RE_lib NAMES bnxt_re)
 endif()
 
 if(NVSHMEM_IBDEVX_SUPPORT)

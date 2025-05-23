@@ -57,6 +57,7 @@ find_package(CUDAToolkit)
 
 if(NVSHMEM_BUILD_IBDEVX_TRANSPORT OR NVSHMEM_BUILD_IBGDA_TRANSPORT)
   find_library(MLX5_lib NAMES mlx5)
+  find_library(BNXT_RE_lib NAMES bnxt_re)
 endif()
 
 if(NVSHMEM_USE_GDRCOPY)
