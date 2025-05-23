@@ -472,6 +472,7 @@ if(NVSHMEM_IBGDA_SUPPORT)
                  modules/transport/common/transport_common.cpp
                  modules/transport/common/transport_ib_common.cpp
                  modules/transport/common/transport_mlx5_common.cpp
+		 modules/transport/common/transport_bnxt_re_common.cpp
   )
   target_link_options(nvshmem_transport_ibgda PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/../nvshmem_transport.sym")
   target_include_directories(nvshmem_transport_ibgda

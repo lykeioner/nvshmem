@@ -37,5 +37,7 @@ if(NVSHMEM_BUILD_IBDEVX_TRANSPORT OR NVSHMEM_BUILD_IBGDA_TRANSPORT OR NVSHMEM_BU
   if(NVSHMEM_BUILD_IBDEVX_TRANSPORT OR NVSHMEM_BUILD_IBGDA_TRANSPORT)
     add_helper_library(nvshmem_transport_mlx5_common OFF transport_mlx5_common.cpp)
     target_link_libraries(nvshmem_transport_mlx5_common PRIVATE MLX5_lib)
+    add_helper_library(nvshmem_transport_bnxt_re_common OFF transport_bnxt_re_common.cpp)
+    target_link_libraries(nvshmem_transport_bnxt_re_common PRIVATE BNXT_RE_lib)
   endif()
 endif()
