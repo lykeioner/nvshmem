@@ -407,6 +407,7 @@ static size_t ibgda_get_host_page_size() {
     return host_page_size;
 }
 
+#ifdef NVSHMEM_USE_GDRCOPY
 int nvshmemt_ibgda_progress(nvshmem_transport_t t) {
     nvshmemt_ibgda_state_t *ibgda_state = (nvshmemt_ibgda_state_t *)t->state;
     int n_devs_selected = ibgda_state->n_devs_selected;
@@ -460,6 +461,11 @@ int nvshmemt_ibgda_progress(nvshmem_transport_t t) {
     }
     return 0;
 }
+#else
+int nvshmemt_ibgda_progress(nvshmem_transport_t t) {
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
+}
+#endif
 
 int nvshmemt_ibgda_show_info(struct nvshmem_transport *transport, int style) {
     NVSHMEMI_ERROR_PRINT("ibgda show info not implemented");
