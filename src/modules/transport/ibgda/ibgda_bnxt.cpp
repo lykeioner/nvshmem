@@ -29,16 +29,12 @@
 #include "non_abi/nvshmemx_error.h"                      // for NVSHMEMX_ERROR_INTERNAL
 #include "non_abi/nvshmem_build_options.h"               // IWYU pragma: keep
 #include "non_abi/nvshmem_version.h"
-#include "infiniband/mlx5dv.h"  // for DEVX_SET, DEVX_ST_SZ_BYTES
 #include "infiniband/verbs.h"   // for ibv_ah_attr, ibv_port_attr
-#include "mlx5_ifc.h"           // for mlx5_ifc_qpc_bits, mlx5_ifc...
-#include "mlx5_prm.h"           // for mlx5_ifc_cqc_bits, mlx5_ifc...
 #include "internal/bootstrap_host_transport/nvshmemi_bootstrap_defines.h"  // for bootstrap_handle_t
 #include "internal/host_transport/nvshmemi_transport_defines.h"  // for nvshmem_mem_handle_t, NVSHM...
 #include "internal/host_transport/transport.h"  // for nvshmem_transport, nvshmem_...
 #include "transport_common.h"                   // for nvshmemt_ibv_function_table
 #include "transport_ib_common.h"                // for nvshmemt_ib_common_mem_handle
-#include "transport_mlx5_common.h"              // for nvshmemt_ib_common_check_ni...
 #ifdef NVSHMEM_USE_GDRCOPY
 #include "transport_gdr_common.h"
 #endif
@@ -152,10 +148,6 @@ struct ibgda_mem_object {
 	void *gpu_ptr;
 	size_t size;
     } aligned;
-    union {
-	struct mlx5dv_devx_umem *umem;
-	struct mlx5dv_devx_uar *uar;
-    };
     bool has_cpu_mapping : 1;
     bool has_gpu_mapping : 1;
     bool has_nic_mapping : 1;
@@ -165,12 +157,10 @@ struct ibgda_mem_object {
 };
 
 struct ibgda_cq {
-    struct mlx5dv_devx_obj *devx_cq;
     uint32_t cqn;
     uint32_t num_cqe;
     struct ibgda_mem_object *cq_mobject;
     struct ibgda_mem_object *dbr_mobject;
-    struct mlx5dv_devx_uar *uar;
     off_t cq_offset;
     off_t dbr_offset;
 };
@@ -179,7 +169,6 @@ struct ibgda_ep {
     nvshmemi_ibgda_device_qp_type_t qp_type;
 
     union {
-	struct mlx5dv_devx_obj *devx_qp;
 	struct ibv_qp *ib_qp;
     };
     uint32_t qpn;
@@ -242,7 +231,6 @@ struct ibgda_device {
 	struct ibv_cq *send_cq;
 	struct ibv_cq *recv_cq;
 	struct ibv_ah *ah;
-	struct mlx5dv_ah dah;
 	struct ibv_ah_attr ah_attr;
     } dct;
     struct {
@@ -407,57 +395,8 @@ static size_t ibgda_get_host_page_size() {
 }
 
 int nvshmemt_ibgda_progress(nvshmem_transport_t t) {
-    nvshmemt_ibgda_state_t *ibgda_state = (nvshmemt_ibgda_state_t *)t->state;
-    int n_devs_selected = ibgda_state->n_devs_selected;
-    int n_pes = t->n_pes;
-    struct mlx5_wqe_ctrl_seg ctrl_seg;
-    for (int j = 0; j < n_devs_selected; j++) {
-	struct ibgda_device *device;
-	int dev_idx;
-	int num_prod_idx_slots;
-	uint64_t *prod_idx_cache;
-	uint64_t *prod_idx_snapshot;
-	uint64_t *prod_idx_array;
-
-	dev_idx = ibgda_state->selected_dev_ids[j];
-	device = (struct ibgda_device *)ibgda_state->devices + dev_idx;
-	num_prod_idx_slots = device->dci.num_eps + device->rc.num_eps_per_pe * n_pes;
-	prod_idx_cache = device->qp_shared_object.prod_idx_cache;
-	prod_idx_snapshot = device->qp_shared_object.prod_idx_snapshot;
-	prod_idx_array = (uint64_t *)device->qp_shared_object.prod_idx_mobject->aligned.cpu_ptr;
-
-	gdrcopy_ftable.copy_from_mapping(device->qp_shared_object.prod_idx_mobject->mh,
-					 prod_idx_snapshot, prod_idx_array,
-					 sizeof(uint64_t) * num_prod_idx_slots);
-
-	for (int i = 0; i < num_prod_idx_slots; ++i) {
-	    uint64_t prod_idx = prod_idx_snapshot[i];
-	    struct ibgda_ep *ep;
-	    __be32 *dbrec;
-	    __be64 *bf;
-	    if (prod_idx_cache[i] < prod_idx) {
-		if (i < device->dci.num_eps)
-		    ep = device->dci.eps[i];
-		else
-		    ep = device->rc.eps[i - device->dci.num_eps];
-
-		dbrec = (__be32 *)((uintptr_t)ep->dbr_mobject->aligned.cpu_ptr + ep->dbr_offset +
-				   sizeof(__be32));
-		bf = (__be64 *)ep->uar_mobject->aligned.cpu_ptr;
-
-		memset((void *)&ctrl_seg, 0, sizeof(ctrl_seg));
-		ctrl_seg.qpn_ds = htobe32(ep->qpn << 8);
-		ctrl_seg.opmod_idx_opcode = htobe32(prod_idx << 8);
-
-		IBGDA_WRITE_ONCE(*dbrec, htobe32(prod_idx & 0xffff));
-		STORE_BARRIER();
-		IBGDA_WRITE_ONCE(*bf, *((__be64 *)&ctrl_seg));
-
-		prod_idx_cache[i] = prod_idx;
-	    }
-	}
-    }
-    return 0;
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 int nvshmemt_ibgda_show_info(struct nvshmem_transport *transport, int style) {
@@ -662,79 +601,13 @@ out:
 
 static int ibgda_mobject_nic_map(struct ibgda_mem_object *mobject, struct ibv_context *context,
 				 uint32_t access, bool use_dmabuf = false) {
-    int status = 0;
-    void *addr;
-    struct mlx5dv_devx_umem *umem = NULL;
 
-    assert(mobject);
-    assert(!mobject->has_nic_mapping);
-    assert(context);
-
-    if (mobject->mem_type == IBGDA_MEM_TYPE_GPU) {
-	addr = (void *)mobject->aligned.gpu_ptr;
-    } else if (mobject->mem_type == IBGDA_MEM_TYPE_HOST) {
-	addr = mobject->aligned.cpu_ptr;
-    } else {
-	status = NVSHMEMX_ERROR_INTERNAL;
-	NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			      "invalid mem_type specified.\n");
-	assert(0);
-    }
-
-    if (use_dmabuf && mobject->mem_type == IBGDA_MEM_TYPE_GPU) {
-#ifdef HAVE_MLX5DV_UMEM_MASK_DMABUF
-	int fd;
-	struct mlx5dv_devx_umem_in umem_in = {
-	    0,
-	};
-	const size_t host_page_size = ibgda_get_host_page_size();
-	size_t dmabuf_size = IBGDA_ROUND_UP(mobject->aligned.size, host_page_size);
-	CUCHECKGOTO(ibgda_cuda_syms,
-		    cuMemGetHandleForAddressRange(&fd, (CUdeviceptr)addr, dmabuf_size,
-						  CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0),
-		    status, out);
-	umem_in.addr = 0;
-	umem_in.size = mobject->aligned.size;
-	umem_in.access = access;
-	umem_in.pgsz_bitmap = UINT64_MAX & ~(host_page_size - 1);
-	umem_in.comp_mask = MLX5DV_UMEM_MASK_DMABUF;
-	umem_in.dmabuf_fd = fd;
-	umem = mlx5dv_devx_umem_reg_ex(context, &umem_in);
-	close(fd);
-#else
-	status = NVSHMEMX_ERROR_NOT_SUPPORTED;
-	goto out;
-#endif
-    } else {
-	umem = mlx5dv_devx_umem_reg(context, addr, mobject->aligned.size, access);
-    }
-    if (!umem) {
-	status = NVSHMEMX_ERROR_INTERNAL;
-	goto out;
-    }
-
-    mobject->umem = umem;
-    mobject->has_nic_mapping = true;
-
-out:
-    return status;
+    NVSHMEMI_ERROR_PRINT("ibgda mobject_nic_map not implemented");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 static void ibgda_mobject_nic_unmap(struct ibgda_mem_object *mobject) {
-    int status = 0;
-
-    assert(mobject);
-    assert(mobject->has_nic_mapping);
-    assert(mobject->mem_type != IBGDA_MEM_TYPE_NIC);
-    assert(mobject->umem);
-
-    status = mlx5dv_devx_umem_dereg(mobject->umem);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "mlx5dv_devx_umem_dereg failed.\n");
-
-    mobject->has_nic_mapping = false;
-    mobject->umem = NULL;
-
-out:
+    NVSHMEMI_ERROR_PRINT("ibgda mobject_nic_map not implemented");
     return;
 }
 
@@ -942,104 +815,6 @@ static void ibgda_host_mem_free(struct ibgda_mem_object *mobject) {
     free(mobject);
 }
 
-static int ibgda_nic_mem_gpu_map(struct ibgda_mem_object **pmobject, struct mlx5dv_devx_uar *uar,
-				 size_t size) {
-    int status = 0;
-    bool did_host_reg = false;
-
-    void *ptr = 0;
-
-    struct ibgda_mem_object *mobject =
-	(struct ibgda_mem_object *)calloc(1, sizeof(struct ibgda_mem_object));
-    NVSHMEMI_NULL_ERROR_JMP(mobject, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
-			    "Unable to allocate a new mobject.\n");
-
-    status = cudaHostRegister(
-	uar->reg_addr, size,
-	cudaHostRegisterPortable | cudaHostRegisterMapped | cudaHostRegisterIoMemory);
-    if (status != cudaSuccess) {
-	NVSHMEMI_WARN_PRINT(
-	    "cudaHostRegister with IoMemory failed with error=%d. We may need to use a fallback "
-	    "path.\n",
-	    status);
-	status = NVSHMEMX_ERROR_INTERNAL;
-	goto out;
-    }
-    did_host_reg = true;
-
-    status = cudaHostGetDevicePointer(&ptr, uar->reg_addr, 0);
-    NVSHMEMI_NE_ERROR_JMP(status, cudaSuccess, NVSHMEMX_ERROR_INTERNAL, out,
-			  "cudaHostGetDevicePointer failed.\n");
-
-    mobject->mem_type = IBGDA_MEM_TYPE_NIC;
-
-    mobject->base.cpu_ptr = uar->reg_addr;
-    mobject->base.gpu_ptr = ptr;
-    mobject->base.size = size;
-
-    mobject->aligned.cpu_ptr = uar->reg_addr;
-    mobject->aligned.gpu_ptr = ptr;
-    mobject->aligned.size = size;
-
-    mobject->uar = uar;
-
-    mobject->has_cpu_mapping = true;
-    mobject->has_gpu_mapping = true;
-    mobject->has_nic_mapping = true;
-
-    *pmobject = mobject;
-
-out:
-    if (status) {
-	if (did_host_reg) {
-	    cudaError_t _status = cudaHostUnregister(uar->reg_addr);
-	    CUDA_RUNTIME_ERROR_STRING(_status);
-	}
-	if (mobject) free(mobject);
-    }
-    return status;
-}
-
-static void ibgda_nic_mem_gpu_unmap(struct ibgda_mem_object *mobject) {
-    cudaError_t status;
-
-    if (!mobject) return;
-
-    assert(mobject->mem_type == IBGDA_MEM_TYPE_NIC);
-
-    status = cudaHostUnregister(mobject->uar->reg_addr);
-    CUDA_RUNTIME_ERROR_STRING(status);
-
-    free(mobject);
-}
-
-static int ibgda_nic_mem_cpu_map(struct ibgda_mem_object **pmobject, struct mlx5dv_devx_uar *uar,
-				 size_t size) {
-    int status = 0;
-
-    struct ibgda_mem_object *mobject =
-	(struct ibgda_mem_object *)calloc(1, sizeof(struct ibgda_mem_object));
-    NVSHMEMI_NULL_ERROR_JMP(mobject, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
-			    "Unable to allocate a new mobject.\n");
-
-    mobject->mem_type = IBGDA_MEM_TYPE_NIC;
-
-    mobject->base.cpu_ptr = uar->reg_addr;
-    mobject->base.size = size;
-
-    mobject->aligned.cpu_ptr = uar->reg_addr;
-    mobject->aligned.size = size;
-
-    mobject->uar = uar;
-
-    mobject->has_cpu_mapping = true;
-    mobject->has_nic_mapping = true;
-
-    *pmobject = mobject;
-
-out:
-    return status;
-}
 
 static void ibgda_nic_mem_cpu_unmap(struct ibgda_mem_object *mobject) {
     assert(mobject->mem_type == IBGDA_MEM_TYPE_NIC);
@@ -1067,103 +842,13 @@ static inline void ibgda_nic_control_free(struct ibgda_mem_object *mobject) {
 }
 
 static int ibgda_create_cq(struct ibgda_cq **pgcq, struct ibgda_device *device) {
-    int status = 0;
-
-    struct ibgda_cq *gcq = NULL;
-
-    struct ibv_pd *pd = device->pd;
-    struct ibv_context *context = pd->context;
-
-    void *cq_context;
-
-    uint8_t cmd_in[DEVX_ST_SZ_BYTES(create_cq_in)] = {
-	0,
-    };
-    uint8_t cmd_out[DEVX_ST_SZ_BYTES(create_cq_out)] = {
-	0,
-    };
-
-    size_t num_cqe = IBGDA_ROUND_UP_POW2_OR_0(ibgda_qp_depth);
-
-    struct mlx5dv_devx_umem *cq_umem = device->cq_shared_object.cq_mobject->umem;
-    off_t cq_offset = device->cq_shared_object.cur_cq_off;
-
-    struct mlx5dv_devx_umem *dbr_umem = device->cq_shared_object.dbr_mobject->umem;
-    off_t dbr_offset = device->cq_shared_object.cur_dbr_off;
-
-    struct mlx5dv_devx_uar *uar = NULL;
-
-    uint32_t eqn;
-
-    gcq = (struct ibgda_cq *)calloc(1, sizeof(struct ibgda_cq));
-    NVSHMEMI_NULL_ERROR_JMP(gcq, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
-			    "Unable to allocate mem for cq.\n");
-
-    // Query the first EQ
-    status = mlx5dv_devx_query_eqn(context, 0, &eqn);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "mlx5dv_devx_query_eqn failed.\n");
-
-    // CQ needs UAR but IBGDA never uses it.
-    // So, we don't map this UAR to GPU space.
-    uar = mlx5dv_devx_alloc_uar(context, MLX5DV_UAR_ALLOC_TYPE_NC);
-    NVSHMEMI_NULL_ERROR_JMP(uar, status, ENOMEM, out, "cannot allocate mlx5dv_devx_uar\n");
-
-    DEVX_SET(create_cq_in, cmd_in, opcode, MLX5_CMD_OP_CREATE_CQ);
-    DEVX_SET(create_cq_in, cmd_in, cq_umem_id, cq_umem->umem_id);  // CQ buffer
-    DEVX_SET(create_cq_in, cmd_in, cq_umem_valid,
-	     IBGDA_MLX5_UMEM_VALID_ENABLE);  // Enable cq_umem_id
-    DEVX_SET64(create_cq_in, cmd_in, cq_umem_offset, cq_offset);
-
-    cq_context = DEVX_ADDR_OF(create_cq_in, cmd_in, cq_context);
-    DEVX_SET(cqc, cq_context, dbr_umem_valid, IBGDA_MLX5_UMEM_VALID_ENABLE);
-    DEVX_SET(cqc, cq_context, cqe_sz, MLX5_CQE_SIZE_64B);
-    DEVX_SET(cqc, cq_context, cc, 0x1);  // Use collapsed CQ
-    DEVX_SET(cqc, cq_context, oi, 0x1);  // Allow overrun
-    DEVX_SET(cqc, cq_context, dbr_umem_id, dbr_umem->umem_id);
-    DEVX_SET(cqc, cq_context, log_cq_size, IBGDA_ILOG2_OR0(num_cqe));
-    DEVX_SET(cqc, cq_context, uar_page, uar->page_id);
-    DEVX_SET(cqc, cq_context, c_eqn, eqn);
-    DEVX_SET(cqc, cq_context, log_page_size, IBGDA_GPAGE_BITS - MLX5_ADAPTER_PAGE_SHIFT);
-    DEVX_SET64(cqc, cq_context, dbr_addr, dbr_offset);  // DBR offset
-
-    gcq->devx_cq =
-	mlx5dv_devx_obj_create(context, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
-    NVSHMEMI_NULL_ERROR_JMP(gcq->devx_cq, status, NVSHMEMX_ERROR_INTERNAL, out,
-			    "Unable to create CQ.\n");
-
-    gcq->cqn = DEVX_GET(create_cq_out, cmd_out, cqn);
-    gcq->num_cqe = num_cqe;
-    gcq->cq_mobject = device->cq_shared_object.cq_mobject;
-    gcq->cq_offset = cq_offset;
-    gcq->dbr_mobject = device->cq_shared_object.dbr_mobject;
-    gcq->dbr_offset = dbr_offset;
-    gcq->uar = uar;
-
-    device->cq_shared_object.cur_cq_off += device->cq_shared_object.cq_buf_size_per_cq;
-    device->cq_shared_object.cur_dbr_off += IBGDA_DBRSIZE;
-
-    *pgcq = gcq;
-
-out:
-    if (status) {
-	if (uar) mlx5dv_devx_free_uar(uar);
-	if (gcq) free(gcq);
-    }
-    return status;
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 static void ibgda_destroy_cq(struct ibgda_cq *gcq) {
-    if (!gcq) return;
-
-    if (gcq->devx_cq) {
-	mlx5dv_devx_obj_destroy(gcq->devx_cq);
-    }
-
-    if (gcq->uar) {
-	mlx5dv_devx_free_uar(gcq->uar);
-    }
-
-    free(gcq);
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    return;
 }
 
 static void ibgda_get_device_cq(nvshmemi_ibgda_device_cq_t *dev_cq, const struct ibgda_cq *cq) {
@@ -1178,227 +863,26 @@ static void ibgda_get_device_cq(nvshmemi_ibgda_device_cq_t *dev_cq, const struct
 }
 
 static int ibgda_qp_rst2init(struct ibgda_ep *ep, const struct ibgda_device *device, int portid) {
-    int status = 0;
-
-    uint8_t cmd_in[DEVX_ST_SZ_BYTES(rst2init_qp_in)] = {
-	0,
-    };
-    uint8_t cmd_out[DEVX_ST_SZ_BYTES(rst2init_qp_out)] = {
-	0,
-    };
-
-    void *qpc;
-
-    const struct ibv_port_attr *port_attr = device->port_attr + (portid - 1);
-
-    assert(ep->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI ||
-	   ep->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC);
-
-    DEVX_SET(rst2init_qp_in, cmd_in, opcode, MLX5_CMD_OP_RST2INIT_QP);
-    DEVX_SET(rst2init_qp_in, cmd_in, qpn, ep->qpn);
-
-    qpc = DEVX_ADDR_OF(rst2init_qp_in, cmd_in, qpc);
-    if (ep->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) {
-	DEVX_SET64(qpc, qpc, dc_access_key, IBGDA_DC_ACCESS_KEY);
-    } else if (ep->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC) {
-	DEVX_SET(qpc, qpc, rwe, 1); /* remote write access */
-	DEVX_SET(qpc, qpc, rre, 1); /* remote read access */
-	DEVX_SET(qpc, qpc, rae, 1); /* remote atomic access */
-	/* Currently, NVSHMEM APIs only support atomics up to 64. This field can be updated to
-	 * support atomics up to 256 bytes. */
-	DEVX_SET(qpc, qpc, atomic_mode, IBGDA_MLX5_QPC_ATOMIC_MODE_UP_TO_64BIT);
-    }
-
-    DEVX_SET(qpc, qpc, primary_address_path.vhca_port_num, portid);
-
-    if (port_attr->link_layer == IBV_LINK_LAYER_INFINIBAND)
-	DEVX_SET(qpc, qpc, primary_address_path.pkey_index, 0);
-
-    DEVX_SET(qpc, qpc, pm_state, MLX5_QPC_PM_STATE_MIGRATED);
-    DEVX_SET(qpc, qpc, counter_set_id, 0x0);  // Not connected to a counter set
-
-    status = mlx5dv_devx_obj_modify(ep->devx_qp, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "Error in mlx5dv_devx_obj_modify for RST2INIT_QP with syndrome %x\n",
-			  DEVX_GET(rst2init_qp_out, cmd_out, syndrome));
-
-    ep->portid = portid;
-
-out:
-    return status;
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 static int ibgda_dci_init2rtr(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_ep *ep,
 			      const struct ibgda_device *device, int portid) {
-    int status = 0;
-
-    uint8_t cmd_in[DEVX_ST_SZ_BYTES(init2rtr_qp_in)] = {
-	0,
-    };
-    uint8_t cmd_out[DEVX_ST_SZ_BYTES(init2rtr_qp_out)] = {
-	0,
-    };
-
-    void *qpc;
-
-    const struct ibv_port_attr *port_attr = device->port_attr + (portid - 1);
-
-    assert(ep->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI);
-
-    DEVX_SET(init2rtr_qp_in, cmd_in, opcode, MLX5_CMD_OP_INIT2RTR_QP);
-    DEVX_SET(init2rtr_qp_in, cmd_in, qpn, ep->qpn);
-
-    qpc = DEVX_ADDR_OF(init2rtr_qp_in, cmd_in, qpc);
-    DEVX_SET(qpc, qpc, mtu, port_attr->active_mtu);
-    DEVX_SET(qpc, qpc, log_msg_max, IBGDA_LOG_MAX_MSG_SIZE);
-
-    if (port_attr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
-	DEVX_SET(qpc, qpc, primary_address_path.sl, ibgda_state->options->IB_SL);
-    } else if (port_attr->link_layer == IBV_LINK_LAYER_ETHERNET) {
-	DEVX_SET(qpc, qpc, primary_address_path.tclass, ibgda_state->options->IB_TRAFFIC_CLASS);
-	DEVX_SET(qpc, qpc, primary_address_path.eth_prio, ibgda_state->options->IB_SL);
-	DEVX_SET(qpc, qpc, primary_address_path.dscp, ibgda_state->options->IB_TRAFFIC_CLASS >> 2);
-    }
-
-    status = mlx5dv_devx_obj_modify(ep->devx_qp, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "Error in mlx5dv_devx_obj_modify for INIT2RTR_QP with syndrome %x\n",
-			  DEVX_GET(init2rtr_qp_out, cmd_out, syndrome));
-
-out:
-    return status;
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 static int ibgda_rc_init2rtr(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_ep *ep,
 			     const struct ibgda_device *device, int portid,
 			     struct ibgda_rc_handle *peer_ep_handle) {
-    int status = 0;
-
-    uint8_t cmd_in[DEVX_ST_SZ_BYTES(init2rtr_qp_in)] = {
-	0,
-    };
-    uint8_t cmd_out[DEVX_ST_SZ_BYTES(init2rtr_qp_out)] = {
-	0,
-    };
-
-    void *qpc;
-
-    const struct ibv_port_attr *port_attr = device->port_attr + (portid - 1);
-
-    assert(ep->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC);
-
-    DEVX_SET(init2rtr_qp_in, cmd_in, opcode, MLX5_CMD_OP_INIT2RTR_QP);
-    DEVX_SET(init2rtr_qp_in, cmd_in, qpn, ep->qpn);
-
-    qpc = DEVX_ADDR_OF(init2rtr_qp_in, cmd_in, qpc);
-    DEVX_SET(qpc, qpc, mtu, port_attr->active_mtu);
-    DEVX_SET(qpc, qpc, log_msg_max, IBGDA_LOG_MAX_MSG_SIZE);
-    DEVX_SET(qpc, qpc, remote_qpn, peer_ep_handle->qpn);
-    DEVX_SET(qpc, qpc, min_rnr_nak, IBGDA_MIN_RNR_NAK);
-    DEVX_SET(qpc, qpc, log_rra_max, IBGDA_ILOG2_OR0(device->device_attr.max_qp_rd_atom));
-
-    if (port_attr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
-	DEVX_SET(qpc, qpc, primary_address_path.tclass, ibgda_state->options->IB_TRAFFIC_CLASS);
-	DEVX_SET(qpc, qpc, primary_address_path.rlid, peer_ep_handle->lid);
-	DEVX_SET(qpc, qpc, primary_address_path.mlid, 0);
-	DEVX_SET(qpc, qpc, primary_address_path.sl, ibgda_state->options->IB_SL);
-	DEVX_SET(qpc, qpc, primary_address_path.grh, false);
-    } else if (port_attr->link_layer == IBV_LINK_LAYER_ETHERNET) {
-	struct ibv_ah_attr ah_attr;
-	struct ibv_ah *ah;
-	struct mlx5dv_obj dv;
-	struct mlx5dv_ah dah;
-
-	const char *nic_device_name = ftable.get_device_name(device->context->device);
-	int roce_version = 0;
-
-	ib_get_gid_index(&ftable, device->context, portid, port_attr->gid_tbl_len,
-			 (int *)&device->gid_info[portid - 1].local_gid_index,
-			 ibgda_state->log_level, ibgda_state->options);
-	ftable.query_gid(device->context, portid, device->gid_info[portid - 1].local_gid_index,
-			 (ibv_gid *)&device->gid_info[portid - 1].local_gid);
-
-	status = ib_roce_get_version_num(
-	    nic_device_name, portid, device->gid_info[portid - 1].local_gid_index, &roce_version);
-	NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			      "Error in ib_roce_get_version_num\n");
-
-	memset(&ah_attr, 0, sizeof(ah_attr));
-	ah_attr.is_global = 1;
-	ah_attr.port_num = portid;
-	ah_attr.grh.dgid.global.subnet_prefix = peer_ep_handle->spn;
-	ah_attr.grh.dgid.global.interface_id = peer_ep_handle->iid;
-	ah_attr.grh.sgid_index = device->gid_info[portid - 1].local_gid_index;
-	ah_attr.grh.traffic_class = ibgda_state->options->IB_TRAFFIC_CLASS;
-	ah_attr.sl = ibgda_state->options->IB_SL;
-	ah_attr.src_path_bits = 0;
-
-	assert(roce_version == 1 || roce_version == 2);
-	ah_attr.dlid = port_attr->lid | (roce_version == 1 ? IBGDA_ROCE_V1_UDP_SPORT_BASE
-							   : IBGDA_ROCE_V2_UDP_SPORT_BASE);
-
-	ah = ftable.create_ah(device->pd, &ah_attr);
-	NVSHMEMI_NULL_ERROR_JMP(ah, status, NVSHMEMX_ERROR_INTERNAL, out, "Unable to create ah.\n");
-
-	dv.ah.in = ah;
-	dv.ah.out = &dah;
-	mlx5dv_init_obj(&dv, MLX5DV_OBJ_AH);
-
-	memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rmac_47_32), &dah.av->rmac,
-	       sizeof(dah.av->rmac));
-	DEVX_SET(qpc, qpc, primary_address_path.hop_limit, IBGDA_GRH_HOP_LIMIT);
-	DEVX_SET(qpc, qpc, primary_address_path.src_addr_index,
-		 device->gid_info[portid - 1].local_gid_index);
-	DEVX_SET(qpc, qpc, primary_address_path.eth_prio, ibgda_state->options->IB_SL);
-	DEVX_SET(qpc, qpc, primary_address_path.udp_sport, ah_attr.dlid);
-	DEVX_SET(qpc, qpc, primary_address_path.dscp, ibgda_state->options->IB_TRAFFIC_CLASS >> 2);
-
-	memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rgid_rip), &dah.av->rgid,
-	       sizeof(dah.av->rgid));
-	ep->ah = ah;
-    }
-
-    status = mlx5dv_devx_obj_modify(ep->devx_qp, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "Error in mlx5dv_devx_obj_modify for INIT2RTR_QP with syndrome %x\n",
-			  DEVX_GET(init2rtr_qp_out, cmd_out, syndrome));
-out:
-    return status;
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 static int ibgda_qp_rtr2rts(struct ibgda_ep *ep, const struct ibgda_device *device, int portid) {
-    int status = 0;
-
-    uint8_t cmd_in[DEVX_ST_SZ_BYTES(rtr2rts_qp_in)] = {
-	0,
-    };
-    uint8_t cmd_out[DEVX_ST_SZ_BYTES(rtr2rts_qp_out)] = {
-	0,
-    };
-
-    void *qpc;
-
-    assert(ep->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI ||
-	   ep->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC);
-
-    DEVX_SET(rtr2rts_qp_in, cmd_in, opcode, MLX5_CMD_OP_RTR2RTS_QP);
-    DEVX_SET(rtr2rts_qp_in, cmd_in, qpn, ep->qpn);
-
-    qpc = DEVX_ADDR_OF(rtr2rts_qp_in, cmd_in, qpc);
-    DEVX_SET(qpc, qpc, log_ack_req_freq, 0x0);  // Ack every packet
-    DEVX_SET(qpc, qpc, log_sra_max, IBGDA_ILOG2_OR0(device->device_attr.max_qp_rd_atom));
-    DEVX_SET(qpc, qpc, next_send_psn, 0x0);
-    DEVX_SET(qpc, qpc, retry_count, 7);
-    DEVX_SET(qpc, qpc, rnr_retry, 7);
-    DEVX_SET(qpc, qpc, primary_address_path.ack_timeout, 20);
-
-    status = mlx5dv_devx_obj_modify(ep->devx_qp, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "Error in mlx5dv_devx_obj_modify for RTR2RTS_QP with syndrome %x\n",
-			  DEVX_GET(rtr2rts_qp_out, cmd_out, syndrome));
-
-out:
-    return status;
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 static int ibgda_destroy_internal_buffer(nvshmemt_ibgda_state_t *ibgda_state,
@@ -1591,257 +1075,18 @@ out:
 
 static int ibgda_create_qp_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
 					  struct ibgda_device *device, int n_pes) {
-    int status = 0;
-
-    struct ibv_context *context = device->context;
-    struct ibv_pd *pd = device->pd;
-
-    struct ibv_srq *srq = NULL;
-    struct ibv_srq_init_attr srq_init_attr;
-
-    struct ibv_cq *recv_cq = NULL;
-
-    struct ibgda_mem_object *prod_idx_mobject = NULL;
-    uint64_t *prod_idx_cache = NULL;
-    uint64_t *prod_idx_snapshot = NULL;
-    unsigned int num_eps = device->dci.num_eps + device->rc.num_eps_per_pe * n_pes;
-
-    mlx5dv_obj dv_obj;
-    struct mlx5dv_pd dvpd;
-    struct mlx5dv_cq dvscq;
-    struct mlx5dv_cq dvrcq;
-    struct mlx5dv_srq dvsrq;
-
-    int pdn = 0;
-    int srqn = 0;
-    int rcqn = 0;
-
-    assert(ibgda_qp_depth > 0);
-    size_t num_wqebb = IBGDA_ROUND_UP_POW2_OR_0(ibgda_qp_depth);
-
-    size_t wq_buf_size_per_qp;
-    size_t wq_buf_size;
-    struct ibgda_mem_object *wq_mobject = NULL;
-
-    size_t dbr_buf_size;
-    struct ibgda_mem_object *dbr_mobject = NULL;
-
-    // Initialization
-    memset(&srq_init_attr, 0, sizeof(srq_init_attr));
-    memset(&dvpd, 0, sizeof(dvpd));
-    memset(&dvscq, 0, sizeof(dvscq));
-    memset(&dvrcq, 0, sizeof(dvrcq));
-    memset(&dvsrq, 0, sizeof(dvsrq));
-
-    // Query pdn
-    memset(&dv_obj, 0, sizeof(dv_obj));
-    dv_obj.pd.in = pd;
-    dv_obj.pd.out = &dvpd;
-
-    status = mlx5dv_init_obj(&dv_obj, MLX5DV_OBJ_PD);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "mlx5dv PD initialization failed.\n");
-
-    pdn = dvpd.pdn;
-
-    // Create srq on host memory.
-    srq_init_attr.attr.max_wr = ibgda_srq_depth;
-    srq_init_attr.attr.max_sge = 1;
-
-    srq = ftable.create_srq(pd, &srq_init_attr);
-    NVSHMEMI_NULL_ERROR_JMP(srq, status, NVSHMEMX_ERROR_INTERNAL, out, "ibv_create_srq failed.\n");
-
-    memset(&dv_obj, 0, sizeof(dv_obj));
-    dvsrq.comp_mask = MLX5DV_SRQ_MASK_SRQN;
-    dv_obj.srq.in = srq;
-    dv_obj.srq.out = &dvsrq;
-
-    status = mlx5dv_init_obj(&dv_obj, MLX5DV_OBJ_SRQ);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "mlx5dv SRQ initialization failed.\n");
-
-    srqn = dvsrq.srqn;
-    NVSHMEMI_EQ_ERROR_JMP(srqn, 0, NVSHMEMX_ERROR_INTERNAL, out,
-			  "Unable to allocate SRQ for your device. "
-			  "This may occur if your ofed is older than version 5.0.\n");
-
-    // Create recv_cq on host memory.
-    recv_cq = ftable.create_cq(context, ibgda_srq_depth, NULL, NULL, 0);
-    NVSHMEMI_NULL_ERROR_JMP(recv_cq, status, NVSHMEMX_ERROR_INTERNAL, out,
-			    "ibv_create_cq for recv_cq failed.\n");
-
-    memset(&dv_obj, 0, sizeof(dv_obj));
-    dv_obj.cq.in = recv_cq;
-    dv_obj.cq.out = &dvrcq;
-
-    status = mlx5dv_init_obj(&dv_obj, MLX5DV_OBJ_CQ);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "mlx5dv RCQ initialization failed.\n");
-
-    rcqn = dvrcq.cqn;
-
-    status = ibgda_create_internal_buffer(&device->qp_shared_object.internal_buf, ibgda_state,
-					  device, n_pes);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "ibgda_create_internal_buffer failed.\n");
-
-    if (ibgda_nic_handler == IBGDA_NIC_HANDLER_CPU) {
-	status = ibgda_gpu_mem_alloc(&prod_idx_mobject, sizeof(uint64_t) * num_eps,
-				     IBGDA_GPAGE_SIZE, true);
-	NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			      "cannot allocate prod_idx_mobject.\n");
-
-	prod_idx_cache = (uint64_t *)calloc(num_eps, sizeof(uint64_t));
-	NVSHMEMI_NULL_ERROR_JMP(prod_idx_cache, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
-				"Unable to allocate mem for prod_idx_cache.\n");
-
-	prod_idx_snapshot = (uint64_t *)calloc(num_eps, sizeof(uint64_t));
-	NVSHMEMI_NULL_ERROR_JMP(prod_idx_snapshot, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
-				"Unable to allocate mem for prod_idx_snapshot.\n");
-    }
-
-    // Allocate and map WQ buffer for all QPs.
-    wq_buf_size_per_qp = num_wqebb * MLX5_SEND_WQE_BB;  // num_wqebb is always a power of 2
-    wq_buf_size = wq_buf_size_per_qp * num_eps;
-    status = ibgda_nic_control_alloc(&wq_mobject, wq_buf_size, IBGDA_GPAGE_SIZE);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot allocate wq buf.\n");
-
-    status = ibgda_mobject_nic_map(wq_mobject, context, IBV_ACCESS_LOCAL_WRITE,
-				   ibgda_state->dmabuf_support_for_control_buffers);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot register wq buf.\n");
-
-    // Allocate and map Doorbell Record buffer for all QPs.
-    dbr_buf_size = IBGDA_DBRSIZE * num_eps;
-    if (ibgda_nic_handler == IBGDA_NIC_HANDLER_GPU)
-	status = ibgda_nic_control_alloc(&dbr_mobject, dbr_buf_size, IBGDA_GPAGE_SIZE);
-    else
-	status = ibgda_host_mem_alloc(&dbr_mobject, dbr_buf_size, IBGDA_GPAGE_SIZE, true);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot allocate dbr buf.\n");
-
-    status = ibgda_mobject_nic_map(dbr_mobject, context, IBV_ACCESS_LOCAL_WRITE,
-				   ibgda_state->dmabuf_support_for_control_buffers);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot register dbr buf.\n");
-
-    // Output
-    device->qp_shared_object.srq = srq;
-    device->qp_shared_object.recv_cq = recv_cq;
-    device->qp_shared_object.pdn = pdn;
-    device->qp_shared_object.srqn = srqn;
-    device->qp_shared_object.rcqn = rcqn;
-    device->qp_shared_object.prod_idx_mobject = prod_idx_mobject;
-    device->qp_shared_object.prod_idx_cache = prod_idx_cache;
-    device->qp_shared_object.prod_idx_snapshot = prod_idx_snapshot;
-    device->qp_shared_object.wq_buf_size_per_qp = wq_buf_size_per_qp;
-    device->qp_shared_object.wq_mobject = wq_mobject;
-    device->qp_shared_object.dbr_mobject = dbr_mobject;
-
-out:
-    if (status) {
-	if (dbr_mobject) {
-	    if (dbr_mobject->has_nic_mapping) ibgda_mobject_nic_unmap(dbr_mobject);
-	    ibgda_nic_control_free(dbr_mobject);
-	}
-	if (wq_mobject) {
-	    if (wq_mobject->has_nic_mapping) ibgda_mobject_nic_unmap(wq_mobject);
-	    ibgda_nic_control_free(wq_mobject);
-	}
-	if (recv_cq) ftable.destroy_cq(recv_cq);
-	if (srq) ftable.destroy_srq(srq);
-	if (prod_idx_mobject) ibgda_gpu_mem_free(prod_idx_mobject);
-	if (prod_idx_cache) free(prod_idx_cache);
-	if (prod_idx_snapshot) free(prod_idx_snapshot);
-    }
-    return status;
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 static int ibgda_alloc_and_map_qp_uar(struct ibv_context *context, ibgda_nic_handler_t handler,
 				      struct ibgda_mem_object **out_mobject) {
-    int status = 0;
-
-    struct mlx5dv_devx_uar *uar = NULL;
-    struct ibgda_mem_object *uar_mobject = NULL;
-    size_t uar_reg_size = 0;
-    uint8_t log_bf_reg_size = 0;
-
-#ifdef HAVE_MLX5DV_UAR_ALLOC_TYPE_NC_DEDICATED
-    uar = mlx5dv_devx_alloc_uar(context, MLX5DV_UAR_ALLOC_TYPE_NC_DEDICATED);
-    if (uar)
-	uar_reg_size = IBGDA_MLX5_NC_UAR_SIZE;
-    else
-#endif
-    {
-	uint8_t cmd_cap_in[DEVX_ST_SZ_BYTES(query_hca_cap_in)] = {
-	    0,
-	};
-	uint8_t cmd_cap_out[DEVX_ST_SZ_BYTES(query_hca_cap_out)] = {
-	    0,
-	};
-	void *cap;
-
-	DEVX_SET(query_hca_cap_in, cmd_cap_in, opcode, MLX5_CMD_OP_QUERY_HCA_CAP);
-	DEVX_SET(query_hca_cap_in, cmd_cap_in, op_mod,
-		 MLX5_SET_HCA_CAP_OP_MOD_GENERAL_DEVICE | (MLX5_CAP_GENERAL << 1) |
-		     HCA_CAP_OPMOD_GET_CUR);
-
-	status = mlx5dv_devx_general_cmd(context, cmd_cap_in, sizeof(cmd_cap_in), cmd_cap_out,
-					 sizeof(cmd_cap_out));
-	NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			      "mlx5dv_devx_general_cmd for hca cap failed.\n");
-
-	cap = DEVX_ADDR_OF(query_hca_cap_out, cmd_cap_out, capability.cmd_hca_cap);
-	log_bf_reg_size = DEVX_GET(cmd_hca_cap, cap, log_bf_reg_size);
-
-	// The size of 1st + 2nd half (as when we use alternating DB)
-	uar_reg_size = 1LLU << log_bf_reg_size;
-
-	// Allocate UAR. This will be used as a DB/BF register.
-	uar = mlx5dv_devx_alloc_uar(context, MLX5DV_UAR_ALLOC_TYPE_BF);
-	NVSHMEMI_NULL_ERROR_JMP(uar, status, ENOMEM, out, "cannot allocate mlx5dv_devx_uar\n");
-    }
-
-    // Map the UAR to GPU
-    if (handler == IBGDA_NIC_HANDLER_GPU) {
-	status = ibgda_nic_mem_gpu_map(&uar_mobject, uar, uar_reg_size);
-	if (status) {
-	    NVSHMEMI_WARN_PRINT(
-		"ibgda_nic_mem_gpu_map failed. We may need to use the CPU fallback path.\n");
-	    status = NVSHMEMX_ERROR_INTERNAL;
-	    goto out;
-	}
-    } else {
-	status = ibgda_nic_mem_cpu_map(&uar_mobject, uar, uar_reg_size);
-	NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			      "ibgda_nic_mem_cpu_map failed.\n");
-    }
-
-    *out_mobject = uar_mobject;
-
-out:
-    if (status) {
-	if (uar_mobject) {
-	    if (handler == IBGDA_NIC_HANDLER_GPU)
-		ibgda_nic_mem_gpu_unmap(uar_mobject);
-	    else
-		ibgda_nic_mem_cpu_unmap(uar_mobject);
-	}
-	if (uar) mlx5dv_devx_free_uar(uar);
-    }
-    return status;
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 static void ibgda_unmap_and_free_qp_uar(struct ibgda_mem_object *mobject) {
-    struct mlx5dv_devx_uar *uar = NULL;
-
-    if (!mobject) return;
-
-    uar = mobject->uar;
-
-    if (mobject->has_gpu_mapping)
-	ibgda_nic_mem_gpu_unmap(mobject);
-    else
-	ibgda_nic_mem_cpu_unmap(mobject);
-
-    if (uar) mlx5dv_devx_free_uar(uar);
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
 }
 
 /**
@@ -1850,149 +1095,8 @@ static void ibgda_unmap_and_free_qp_uar(struct ibgda_mem_object *mobject) {
  */
 static int ibgda_create_qp(struct ibgda_ep **ep_ptr, struct ibgda_device *device, int portid,
 			   uint32_t qp_idx, nvshmemi_ibgda_device_qp_type_t qp_type) {
-    struct ibv_pd *pd = device->pd;
-    struct ibv_context *context = pd->context;
-    struct ibgda_ep *ep = NULL;
-
-    void *qp_context;
-
-    uint8_t cmd_in[DEVX_ST_SZ_BYTES(create_qp_in)] = {
-	0,
-    };
-    uint8_t cmd_out[DEVX_ST_SZ_BYTES(create_qp_out)] = {
-	0,
-    };
-
-    uint8_t cmd_cap_in[DEVX_ST_SZ_BYTES(query_hca_cap_in)] = {
-	0,
-    };
-    uint8_t cmd_cap_out[DEVX_ST_SZ_BYTES(query_hca_cap_out)] = {
-	0,
-    };
-    void *cap;
-
-    struct ibgda_mem_object *uar_mobject = NULL;
-
-    struct mlx5dv_devx_umem *wq_umem = NULL;
-    off_t wq_offset = 0;
-
-    struct mlx5dv_devx_umem *dbr_umem = NULL;
-    off_t dbr_offset = 0;
-
-    int cqe_version = 0;
-
-    struct ibgda_cq *send_cq = NULL;
-
-    size_t num_wqebb = IBGDA_ROUND_UP_POW2_OR_0(ibgda_qp_depth);
-
-    int status = 0;
-
-    assert(qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI ||
-	   qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC);
-
-    DEVX_SET(query_hca_cap_in, cmd_cap_in, opcode, MLX5_CMD_OP_QUERY_HCA_CAP);
-    DEVX_SET(
-	query_hca_cap_in, cmd_cap_in, op_mod,
-	MLX5_SET_HCA_CAP_OP_MOD_GENERAL_DEVICE | (MLX5_CAP_GENERAL << 1) | HCA_CAP_OPMOD_GET_CUR);
-
-    status = mlx5dv_devx_general_cmd(context, cmd_cap_in, sizeof(cmd_cap_in), cmd_cap_out,
-				     sizeof(cmd_cap_out));
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "mlx5dv_devx_general_cmd for hca cap failed.\n");
-
-    cap = DEVX_ADDR_OF(query_hca_cap_out, cmd_cap_out, capability.cmd_hca_cap);
-    cqe_version = DEVX_GET(cmd_hca_cap, cap, cqe_version);
-    if (cqe_version != 1) {
-	NVSHMEMI_ERROR_JMP(status, NVSHMEMX_ERROR_NOT_SUPPORTED, out,
-			   "hca_cap.cqe_version != 1 is not supported.\n");
-    }
-
-    // Create send_cq on GPU memory.
-    status = ibgda_create_cq(&send_cq, device);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "ibgda_create_cq failed.\n");
-
-    ep = (struct ibgda_ep *)calloc(1, sizeof(struct ibgda_ep));
-    NVSHMEMI_NULL_ERROR_JMP(ep, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
-			    "Unable to allocate mem for ep.\n");
-
-    // Allocate and map UAR. This will be used as a DB/BF register.
-    status = ibgda_alloc_and_map_qp_uar(context, ibgda_nic_handler, &uar_mobject);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "ibgda_alloc_and_map_qp_uar failed\n");
-
-    wq_umem = device->qp_shared_object.wq_mobject->umem;
-    wq_offset = device->qp_shared_object.cur_wq_off;
-
-    dbr_umem = device->qp_shared_object.dbr_mobject->umem;
-    dbr_offset = device->qp_shared_object.cur_dbr_off;
-
-    DEVX_SET(create_qp_in, cmd_in, opcode, MLX5_CMD_OP_CREATE_QP);
-    DEVX_SET(create_qp_in, cmd_in, wq_umem_id, wq_umem->umem_id);  // WQ buffer
-    DEVX_SET64(create_qp_in, cmd_in, wq_umem_offset, wq_offset);
-    DEVX_SET(create_qp_in, cmd_in, wq_umem_valid,
-	     IBGDA_MLX5_UMEM_VALID_ENABLE);  // Enable wq_umem_id
-
-    qp_context = DEVX_ADDR_OF(create_qp_in, cmd_in, qpc);
-    DEVX_SET(qpc, qp_context, st,
-	     qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI ? IBGDA_MLX5_QPC_ST_DCI
-							  : IBGDA_MLX5_QPC_ST_RC);
-    DEVX_SET(qpc, qp_context, pm_state, MLX5_QPC_PM_STATE_MIGRATED);
-    DEVX_SET(qpc, qp_context, pd, device->qp_shared_object.pdn);
-    DEVX_SET(qpc, qp_context, uar_page, uar_mobject->uar->page_id);  // BF register
-    DEVX_SET(qpc, qp_context, rq_type, IBGDA_SRQ_TYPE_VALUE);        // Shared Receive Queue
-    DEVX_SET(qpc, qp_context, srqn_rmpn_xrqn, device->qp_shared_object.srqn);
-    DEVX_SET(qpc, qp_context, cqn_snd, send_cq->cqn);
-    DEVX_SET(qpc, qp_context, cqn_rcv, device->qp_shared_object.rcqn);
-    DEVX_SET(qpc, qp_context, log_sq_size, IBGDA_ILOG2_OR0(num_wqebb));
-    DEVX_SET(qpc, qp_context, log_rq_size, 0);
-    DEVX_SET(qpc, qp_context, cs_req, 0);                                     // Disable CS Request
-    DEVX_SET(qpc, qp_context, cs_res, 0);                                     // Disable CS Response
-    DEVX_SET(qpc, qp_context, dbr_umem_valid, IBGDA_MLX5_UMEM_VALID_ENABLE);  // Enable dbr_umem_id
-    DEVX_SET64(qpc, qp_context, dbr_addr,
-	       dbr_offset);  // Offset of dbr_umem_id (behavior changed because of dbr_umem_valid)
-    DEVX_SET(qpc, qp_context, dbr_umem_id, dbr_umem->umem_id);  // DBR buffer
-    DEVX_SET(qpc, qp_context, user_index, qp_idx);
-    DEVX_SET(qpc, qp_context, page_offset, 0);
-
-    ep->devx_qp = mlx5dv_devx_obj_create(context, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
-    NVSHMEMI_NULL_ERROR_JMP(ep->devx_qp, status, NVSHMEMX_ERROR_INTERNAL, out,
-			    "Unable to create QP for EP.\n");
-
-    ep->qpn = DEVX_GET(create_qp_out, cmd_out, qpn);
-    ep->portid = portid;
-
-    ep->sq_cnt = num_wqebb;
-    ep->sq_buf_offset = 0;
-
-    ep->rq_cnt = 0;
-    ep->rq_buf_offset = 0;
-
-    ep->wq_mobject = device->qp_shared_object.wq_mobject;
-    ep->wq_offset = wq_offset;
-    device->qp_shared_object.cur_wq_off += device->qp_shared_object.wq_buf_size_per_qp;
-
-    ep->dbr_mobject = device->qp_shared_object.dbr_mobject;
-    ep->dbr_offset = dbr_offset;
-    device->qp_shared_object.cur_dbr_off += IBGDA_DBRSIZE;
-
-    ep->uar_mobject = uar_mobject;
-
-    ep->send_cq = send_cq;
-
-    ep->qp_type = qp_type;
-
-    ep->user_index = qp_idx;
-
-    *ep_ptr = ep;
-
-out:
-    if (status) {
-	if (uar_mobject) ibgda_unmap_and_free_qp_uar(uar_mobject);
-	if (send_cq) ibgda_destroy_cq(send_cq);
-	if (ep) free(ep);
-    }
-
-    return status;
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 static int ibgda_get_rc_handle(struct ibgda_rc_handle *rc_handle, const struct ibgda_ep *ep,
@@ -2047,215 +1151,21 @@ out:
 
 static int ibgda_create_dct_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
 					   struct ibgda_device *device, int portid) {
-    int status = 0;
-
-    const struct ibv_port_attr *port_attr = device->port_attr + (portid - 1);
-    struct ibv_context *context = device->context;
-
-    struct ibv_pd *pd = NULL;
-    struct ibv_parent_domain_init_attr pd_init_attr;
-
-    struct ibv_srq *srq = NULL;
-    struct ibv_srq_init_attr srq_init_attr;
-
-    struct ibv_cq *send_cq = NULL;
-    struct ibv_cq *recv_cq = NULL;
-
-    struct ibv_ah *ah = NULL;
-    struct mlx5dv_ah dah;
-    struct ibv_ah_attr ah_attr;
-    struct mlx5dv_obj dv;
-
-    bool support_half_av_seg;
-    int hca_support_compact_address_vector;
-
-    uint8_t cmd_cap_in[DEVX_ST_SZ_BYTES(query_hca_cap_in)] = {
-	0,
-    };
-    uint8_t cmd_cap_out[DEVX_ST_SZ_BYTES(query_hca_cap_out)] = {
-	0,
-    };
-    void *cap;
-
-    DEVX_SET(query_hca_cap_in, cmd_cap_in, opcode, MLX5_CMD_OP_QUERY_HCA_CAP);
-    DEVX_SET(
-	query_hca_cap_in, cmd_cap_in, op_mod,
-	MLX5_SET_HCA_CAP_OP_MOD_GENERAL_DEVICE | (MLX5_CAP_GENERAL << 1) | HCA_CAP_OPMOD_GET_CUR);
-
-    status = mlx5dv_devx_general_cmd(context, cmd_cap_in, sizeof(cmd_cap_in), cmd_cap_out,
-				     sizeof(cmd_cap_out));
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "mlx5dv_devx_general_cmd for hca cap failed.\n");
-
-    cap = DEVX_ADDR_OF(query_hca_cap_out, cmd_cap_out, capability.cmd_hca_cap);
-    hca_support_compact_address_vector = DEVX_GET(cmd_hca_cap, cap, compact_address_vector);
-
-    memset(&pd_init_attr, 0, sizeof(pd_init_attr));
-    memset(&srq_init_attr, 0, sizeof(srq_init_attr));
-
-    pd_init_attr.pd = device->pd;
-    pd = ibv_alloc_parent_domain(context, &pd_init_attr);
-    NVSHMEMI_NULL_ERROR_JMP(pd, status, NVSHMEMX_ERROR_INTERNAL, out,
-			    "ibv_alloc_parent_domain failed.\n");
-
-    srq_init_attr.attr.max_wr = ibgda_srq_depth;
-    srq_init_attr.attr.max_sge = 1;
-
-    srq = ftable.create_srq(pd, &srq_init_attr);
-    NVSHMEMI_NULL_ERROR_JMP(srq, status, NVSHMEMX_ERROR_INTERNAL, out, "ibv_create_srq failed.\n");
-
-    send_cq = ftable.create_cq(context, ibgda_srq_depth, NULL, NULL, 0);
-    NVSHMEMI_NULL_ERROR_JMP(send_cq, status, NVSHMEMX_ERROR_INTERNAL, out,
-			    "ibv_create_cq for send_cq failed.\n");
-
-    recv_cq = ftable.create_cq(context, ibgda_srq_depth, NULL, NULL, 0);
-    NVSHMEMI_NULL_ERROR_JMP(recv_cq, status, NVSHMEMX_ERROR_INTERNAL, out,
-			    "ibv_create_cq for recv_cq failed.\n");
-
-    if (port_attr->lid == 0) {
-	ib_get_gid_index(&ftable, device->context, portid, port_attr->gid_tbl_len,
-			 (int *)&device->gid_info[portid - 1].local_gid_index,
-			 ibgda_state->log_level, ibgda_state->options);
-	ftable.query_gid(device->context, portid, device->gid_info[portid - 1].local_gid_index,
-			 (ibv_gid *)&device->gid_info[portid - 1].local_gid);
-	ah_attr.is_global = 1;
-	ah_attr.grh.dgid.global.subnet_prefix =
-	    device->gid_info[portid - 1].local_gid.global.subnet_prefix;
-	ah_attr.grh.dgid.global.interface_id =
-	    device->gid_info[portid - 1].local_gid.global.interface_id;
-	ah_attr.grh.flow_label = 0;
-	ah_attr.grh.sgid_index = device->gid_info[portid - 1].local_gid_index;
-	ah_attr.grh.traffic_class = ibgda_state->options->IB_TRAFFIC_CLASS;
-	ah_attr.grh.hop_limit = IBGDA_GRH_HOP_LIMIT;
-	support_half_av_seg = false;
-    } else {
-	// Only IB supports is_global = 0.
-	assert(port_attr->link_layer == IBV_LINK_LAYER_INFINIBAND);
-	ah_attr.dlid = port_attr->lid;
-	ah_attr.is_global = 0;
-	support_half_av_seg = hca_support_compact_address_vector;
-    }
-    ah_attr.sl = ibgda_state->options->IB_SL;
-    ah_attr.src_path_bits = 0;
-    ah_attr.port_num = portid;
-
-    ah = ftable.create_ah(device->pd, &ah_attr);
-    NVSHMEMI_NULL_ERROR_JMP(ah, status, NVSHMEMX_ERROR_INTERNAL, out, "Unable to create ah.\n");
-
-    dv.ah.in = ah;
-    dv.ah.out = &dah;
-    mlx5dv_init_obj(&dv, MLX5DV_OBJ_AH);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "mlx5dv AH initialization failed.\n");
-
-    device->dct.pd = pd;
-    device->dct.srq = srq;
-    device->dct.send_cq = send_cq;
-    device->dct.recv_cq = recv_cq;
-    device->dct.ah = ah;
-    memcpy(&device->dct.dah, &dah, sizeof(dah));
-    memcpy(&device->dct.ah_attr, &ah_attr, sizeof(ah_attr));
-    device->support_half_av_seg = support_half_av_seg;
-
-out:
-    if (status) {
-	if (recv_cq) ftable.destroy_cq(recv_cq);
-	if (send_cq) ftable.destroy_cq(send_cq);
-	if (srq) ftable.destroy_srq(srq);
-    }
-    return status;
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 static int ibgda_create_dct(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_ep **ep_ptr,
 			    const struct ibgda_device *device, int portid) {
-    int status = 0;
-
-    struct ibgda_ep *ep = NULL;
-    struct ibv_qp *ib_qp = NULL;
-
-    struct ibv_qp_init_attr_ex ib_qp_attr_ex;
-    struct mlx5dv_qp_init_attr dv_init_attr;
-    struct ibv_qp_attr ib_qp_attr;
-
-    const struct ibv_port_attr *port_attr = device->port_attr + (portid - 1);
-
-    memset(&ib_qp_attr_ex, 0, sizeof(ib_qp_attr_ex));
-    memset(&dv_init_attr, 0, sizeof(dv_init_attr));
-
-    ep = (struct ibgda_ep *)calloc(1, sizeof(struct ibgda_ep));
-    NVSHMEMI_NULL_ERROR_JMP(ep, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
-			    "Unable to allocate mem for ep.\n");
-
-    dv_init_attr.comp_mask = MLX5DV_QP_INIT_ATTR_MASK_DC;
-    dv_init_attr.dc_init_attr.dc_type = MLX5DV_DCTYPE_DCT;
-    dv_init_attr.dc_init_attr.dct_access_key = IBGDA_DC_ACCESS_KEY;
-
-    ib_qp_attr_ex.pd = device->dct.pd;
-    ib_qp_attr_ex.comp_mask = IBV_QP_INIT_ATTR_PD;
-    ib_qp_attr_ex.qp_type = IBV_QPT_DRIVER;
-    ib_qp_attr_ex.srq = device->dct.srq;
-    ib_qp_attr_ex.send_cq = device->dct.send_cq;
-    ib_qp_attr_ex.recv_cq = device->dct.recv_cq;
-
-    ib_qp_attr_ex.cap.max_send_wr = ibgda_state->options->QP_DEPTH;
-    ib_qp_attr_ex.cap.max_recv_wr = ibgda_state->options->QP_DEPTH;
-    ib_qp_attr_ex.cap.max_send_sge = 1;
-    ib_qp_attr_ex.cap.max_recv_sge = 1;
-    ib_qp_attr_ex.cap.max_inline_data = NVSHMEMI_IBGDA_MAX_INLINE_SIZE;
-
-    ib_qp = mlx5dv_create_qp(device->context, &ib_qp_attr_ex, &dv_init_attr);
-    NVSHMEMI_NULL_ERROR_JMP(ib_qp, status, NVSHMEMX_ERROR_INTERNAL, out,
-			    "mlx5dv_create_qp failed.\n");
-
-    // RST2INIT
-    memset(&ib_qp_attr, 0, sizeof(ib_qp_attr));
-    ib_qp_attr.qp_state = IBV_QPS_INIT;
-    ib_qp_attr.pkey_index = 0;
-    ib_qp_attr.port_num = portid;
-    ib_qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
-				 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
-
-    status = ftable.modify_qp(ib_qp, &ib_qp_attr,
-			      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "ibv_modify_qp rst2init for dct failed.\n");
-
-    // INIT2RTR
-    memset(&ib_qp_attr, 0, sizeof(ib_qp_attr));
-    ib_qp_attr.qp_state = IBV_QPS_RTR;
-    ib_qp_attr.path_mtu = port_attr->active_mtu;
-    ib_qp_attr.min_rnr_timer = 12;
-    memcpy(&ib_qp_attr.ah_attr, &device->dct.ah_attr, sizeof(ib_qp_attr.ah_attr));
-
-    status = ftable.modify_qp(ib_qp, &ib_qp_attr,
-			      IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_MIN_RNR_TIMER);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "ibv_modify_qp init2rtr for dct failed.\n");
-
-    ep->qp_type = NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCT;
-
-    ep->ib_qp = ib_qp;
-    ep->qpn = ib_qp->qp_num;
-    ep->portid = portid;
-
-    *ep_ptr = ep;
-
-out:
-    if (status) {
-	if (ib_qp) {
-	    int _status = ftable.destroy_qp(ib_qp);
-	    if (_status) NVSHMEMI_ERROR_PRINT("ibv_destroy_qp for dct failed.\n");
-	}
-	if (ep) free(ep);
-    }
-    return status;
+    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 static int ibgda_get_dct_handle(struct ibgda_dct_handle *dct_handle, const struct ibgda_ep *ep,
 				const struct ibgda_device *device) {
     assert(ep->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCT);
 
-    memcpy(&dct_handle->dev_dct, device->dct.dah.av, sizeof(dct_handle->dev_dct));
+    //memcpy(&dct_handle->dev_dct, device->dct.dah.av, sizeof(dct_handle->dev_dct));
     // Don't do htobe32 here as we need to determine whether the ext field should be set or not.
     dct_handle->dev_dct.dqp_dct = ep->qpn;
     dct_handle->dev_dct.key.dc_key = htobe64(IBGDA_DC_ACCESS_KEY);
@@ -2274,13 +1184,7 @@ static int ibgda_destroy_ep(struct ibgda_ep *ep) {
 	    if (status) NVSHMEMI_ERROR_PRINT("ibv_destroy_qp failed.\n");
 	}
     } else {
-	if (ep->devx_qp) {
-	    mlx5dv_devx_obj_destroy(ep->devx_qp);
-	}
-
-	if (ep->uar_mobject) {
-	    ibgda_unmap_and_free_qp_uar(ep->uar_mobject);
-	}
+	    /* TBD */
     }
 
     if (ep->send_cq) {
@@ -3656,10 +2560,10 @@ int nvshmemt_init(nvshmem_transport_t *t, struct nvshmemi_cuda_fn_table *table, 
 	const char *name = ftable.get_device_name(device->dev);
 	NVSHMEMI_NULL_ERROR_JMP(name, status, NVSHMEMX_ERROR_INTERNAL, out,
 				"ibv_get_device_name failed \n");
-	if (!strstr(name, "mlx5")) {
+	if (!strstr(name, "bnxt_re")) {
 	    ftable.close_device(device->context);
 	    device->context = NULL;
-	    NVSHMEMI_WARN_PRINT("device %s is not enumerated as an mlx5 device. Skipping...\n",
+	    NVSHMEMI_WARN_PRINT("device %s is not enumerated as an bnxt_re device. Skipping...\n",
 				name);
 	    continue;
 	}
@@ -3667,10 +2571,10 @@ int nvshmemt_init(nvshmem_transport_t *t, struct nvshmemi_cuda_fn_table *table, 
 	status = ftable.query_device(device->context, &device->device_attr);
 	NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "ibv_query_device failed \n");
 
-	if (!nvshmemt_ib_common_query_mlx5_caps(device->context)) {
+	if (0) {
 	    ftable.close_device(device->context);
 	    device->context = NULL;
-	    NVSHMEMI_WARN_PRINT("device %s is not enumerated as an mlx5 device. Skipping...\n",
+	    NVSHMEMI_WARN_PRINT("device %s is not enumerated as an bnxt_re device. Skipping...\n",
 				name);
 	    continue;
 	}
@@ -3705,8 +2609,9 @@ int nvshmemt_init(nvshmem_transport_t *t, struct nvshmemi_cuda_fn_table *table, 
 		 "Fallback to use either nv_peer_mem or nvidia_peermem.\n");
 	}
 
-	status = nvshmemt_ib_common_check_nic_ext_atomic_support(device->context);
-	if (status) {
+	//status = nvshmemt_ib_common_check_nic_ext_atomic_support(device->context);
+	//if (status) {
+	if (0) {
 	    ftable.close_device(device->context);
 	    device->context = NULL;
 	    NVSHMEMI_WARN_PRINT(
@@ -3804,12 +2709,13 @@ int nvshmemt_init(nvshmem_transport_t *t, struct nvshmemi_cuda_fn_table *table, 
 				  "ibv_close_device or ibv_dealloc_pd failed \n");
 	    continue;
 	}
-
+#if 0
 	/* Report whether we need to do atomic endianness conversions on 8 byte operands. */
 	status = nvshmemt_ib_common_query_endianness_conversion_size(&atomic_host_endian_size,
 								     device->context);
 	NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
 			      "nvshmemt_ib_common_query_endianness_conversion_size failed.\n");
+#endif
     }
     INFO(ibgda_state->log_level, "End - Enumerating IB devices in the system\n");
 
