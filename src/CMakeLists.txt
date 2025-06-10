@@ -1,4 +1,4 @@
-# this requires cmake 3.19
+#this requires cmake 3.19
 include(CheckCompilerFlag)
 include(CheckSourceCompiles)
 include(ExternalProject)
@@ -453,6 +453,36 @@ if(NVSHMEM_IBDEVX_SUPPORT)
 endif()
 
 if(NVSHMEM_IBGDA_SUPPORT)
+  add_library(
+    nvshmem_transport_ibgda_bnxt SHARED
+  )
+  nvshmem_library_set_base_config(nvshmem_transport_ibgda_bnxt)
+  target_sources(nvshmem_transport_ibgda_bnxt PRIVATE
+		 modules/transport/ibgda/ibgda_bnxt.cpp
+		 modules/transport/common/transport_common.cpp
+		 modules/transport/common/transport_ib_common.cpp
+		 modules/transport/common/transport_bnxt_re_common.cpp
+  )
+
+  target_link_options(nvshmem_transport_ibgda_bnxt PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/../nvshmem_transport.sym")
+
+  target_include_directories(nvshmem_transport_ibgda_bnxt
+			     PRIVATE include
+			     modules/transport/common
+
+  )
+  target_link_libraries(nvshmem_transport_ibgda_bnxt PRIVATE ${BNXT_RE_lib} CUDA::cudart_static)
+
+  if(NVSHMEM_USE_GDRCOPY)
+    target_include_directories(nvshmem_transport_ibgda_bnxt PRIVATE ${GDRCOPY_INCLUDE})
+    target_sources(nvshmem_transport_ibgda_bnxt PRIVATE
+		   modules/transport/common/transport_gdr_common.cpp
+    )
+  endif()
+  set(ACTIVE_TRANSPORTS ${ACTIVE_TRANSPORTS} nvshmem_transport_ibgda_bnxt)
+endif()
+
+if(NVSHMEM_IBGDA_SUPPORT)
   check_source_compiles(C
     "#include <infiniband/mlx5dv.h>
     int main(void) { int x = MLX5DV_UAR_ALLOC_TYPE_NC_DEDICATED; return 1; }"
@@ -472,8 +502,8 @@ if(NVSHMEM_IBGDA_SUPPORT)
                  modules/transport/common/transport_common.cpp
                  modules/transport/common/transport_ib_common.cpp
                  modules/transport/common/transport_mlx5_common.cpp
-		 modules/transport/common/transport_bnxt_re_common.cpp
   )
+
   target_link_options(nvshmem_transport_ibgda PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/../nvshmem_transport.sym")
   target_include_directories(nvshmem_transport_ibgda
                              PRIVATE include

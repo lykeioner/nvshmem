@@ -94,7 +94,12 @@ macro(nvshmem_transport_set_mlx5_config TRANSPORT_NAME)
     target_link_libraries(${TRANSPORT_NAME} PRIVATE MLX5_lib)
 endmacro()
 
-macro(nvshmem_add_transport TRANSPORT_NAME SOURCE_LIST CUDA_FLAG GDR_FLAG IB_FLAG MLX5_FLAG)
+macro(nvshmem_transport_set_bnxt_re_config TRANSPORT_NAME)
+  target_include_directories(nvshmem_transport_gdr_common PUBLIC ${GDRCOPY_INCLUDE})
+    target_link_libraries(${TRANSPORT_NAME} PRIVATE BNXT_RE_lib)
+endmacro()
+
+macro(nvshmem_add_transport TRANSPORT_NAME SOURCE_LIST CUDA_FLAG GDR_FLAG IB_FLAG MLX5_FLAG BNXT_RE_FLAG)
   add_library(${TRANSPORT_NAME} SHARED)
 
   nvshmem_transport_set_base_config(${TRANSPORT_NAME})
@@ -129,6 +134,10 @@ macro(nvshmem_add_transport TRANSPORT_NAME SOURCE_LIST CUDA_FLAG GDR_FLAG IB_FLA
 
   if(${MLX5_FLAG})
     nvshmem_transport_set_mlx5_config(${TRANSPORT_NAME})
+  endif()
+
+  if(${BNXT_RE_FLAG})
+    nvshmem_transport_set_bnxt_re_config(${TRANSPORT_NAME})
   endif()
 
   install(TARGETS ${TRANSPORT_NAME}
