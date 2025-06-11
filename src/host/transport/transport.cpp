@@ -224,17 +224,28 @@ transport_init:
 transport_fail:
 #ifdef NVSHMEM_IBGDA_SUPPORT
     if (nvshmemi_options.IB_ENABLE_IBGDA) {
-        status = snprintf(transport_object_file, transport_object_file_len,
-                          "nvshmem_transport_ibgda.so.%d", NVSHMEM_TRANSPORT_PLUGIN_MAJOR_VERSION);
-        if (status < 0 || status > transport_object_file_len) {
-            WARN("Unable to open the %s transport. %s\n", transport_object_file, dlerror());
-            goto out;
-        }
-        transport_lib_IBGDA = dlopen(transport_object_file, RTLD_NOW);
-        if (transport_lib_IBGDA == NULL) {
-            WARN("Unable to open the %s transport. %s\n", transport_object_file, dlerror());
-            goto out;
-        }
+	if (nvshmemi_options.IB_ENABLE_IBGDA == 1) {
+	    status = snprintf(transport_object_file, transport_object_file_len,
+		  "nvshmem_transport_ibgda.so.%d", NVSHMEM_TRANSPORT_PLUGIN_MAJOR_VERSION);
+	    if (status < 0 || status > transport_object_file_len) {
+		WARN("Unable to open the %s transport. %s\n", transport_object_file, dlerror());
+		goto out;
+	    }
+	}
+	if (nvshmemi_options.IB_ENABLE_IBGDA == 2) {
+	    status = snprintf(transport_object_file, transport_object_file_len,
+		  "nvshmem_transport_ibgda_bnxt.so.%d", NVSHMEM_TRANSPORT_PLUGIN_MAJOR_VERSION);
+	    if (status < 0 || status > transport_object_file_len) {
+		WARN("Unable to open the %s transport. %s\n", transport_object_file, dlerror());
+		goto out;
+	    }
+	}
+
+	transport_lib_IBGDA = dlopen(transport_object_file, RTLD_NOW);
+	if (transport_lib_IBGDA == NULL) {
+	    WARN("Unable to open the %s transport. %s\n", transport_object_file, dlerror());
+	    goto out;
+	}
 
         init_fn = (nvshmemi_transport_init_fn)dlsym(transport_lib_IBGDA, "nvshmemt_init");
         if (!init_fn) {

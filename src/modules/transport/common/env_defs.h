@@ -140,8 +140,8 @@ NVSHMEMI_ENV_DEF(IBGDA_NIC_HANDLER, string, "auto", NVSHMEMI_ENV_CAT_TRANSPORT,
                  "- auto: use GPU SMs and fallback to CPU if it is not supported (default).\n"
                  "- gpu: use GPU SMs.\n"
                  "- cpu: use CPU.")
-NVSHMEMI_ENV_DEF(IB_ENABLE_IBGDA, bool, false, NVSHMEMI_ENV_CAT_TRANSPORT,
-                 "Set to enable GPU-initiated communication transport.")
+NVSHMEMI_ENV_DEF(IB_ENABLE_IBGDA, int, false, NVSHMEMI_ENV_CAT_TRANSPORT,
+		 "Set to enable GPU-initiated communication transport. 1 = MLX, 2 = BNXT_RE")
 #endif
 
 #endif

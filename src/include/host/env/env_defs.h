@@ -322,8 +322,8 @@ NVSHMEMI_ENV_DEF(NVTX, string, "off", NVSHMEMI_ENV_CAT_NVTX,
 
 #if defined(NVSHMEM_IBGDA_SUPPORT) || defined(NVSHMEM_ENV_ALL)
 /** GPU-initiated communication **/
-NVSHMEMI_ENV_DEF(IB_ENABLE_IBGDA, bool, false, NVSHMEMI_ENV_CAT_TRANSPORT,
-                 "Set to enable GPU-initiated communication transport.")
+NVSHMEMI_ENV_DEF(IB_ENABLE_IBGDA, int, false, NVSHMEMI_ENV_CAT_TRANSPORT,
+		 "Set to enable GPU-initiated communication transport. 1 = MLX, 2 = BNXT_RE")
 #endif
 
 #endif
