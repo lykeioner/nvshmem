@@ -35,6 +35,7 @@
 #include "internal/host_transport/transport.h"  // for nvshmem_transport, nvshmem_...
 #include "transport_common.h"                   // for nvshmemt_ibv_function_table
 #include "transport_ib_common.h"                // for nvshmemt_ib_common_mem_handle
+#include "bnxt_re_dv.h"
 #ifdef NVSHMEM_USE_GDRCOPY
 #include "transport_gdr_common.h"
 #endif
@@ -56,7 +57,6 @@
 
 #define IBGDA_DC_ACCESS_KEY 0x5623CEAF
 
-#define IBGDA_MLX5_QPC_ATOMIC_MODE_UP_TO_64BIT 0x3
 #define IBGDA_DBRSIZE 8
 #define IBGDA_SRQ_TYPE_VALUE 0x1
 
@@ -109,14 +109,14 @@ inline T IBGDA_ILOG2(T _n) {
 
 #define IBGDA_ILOG2_OR0(_n) (((_n) == 0) ? 0 : IBGDA_ILOG2(_n))
 
-enum { IBGDA_MLX5_QPC_ST_RC = 0x0, IBGDA_MLX5_QPC_ST_DCI = 0x5 };
-
+/* TBD - Fix below */
 enum {
-    IBGDA_MLX5_UMEM_VALID_DISABLE = 0x0,
-    IBGDA_MLX5_UMEM_VALID_ENABLE = 0x1,
+	BNXT_SEND_WQE_BB        = 64,
+	BNXT_SEND_WQE_SHIFT     = 6,
 };
 
-enum { IBGDA_MLX5_NC_UAR_SIZE = 8 };
+/* TBD - Fix below */
+enum { IBGDA_BNXT_NC_UAR_SIZE = 12 };
 
 typedef enum {
     IBGDA_NIC_MAPPING_MEMTYPE_REQUEST_AUTO = 0,
@@ -148,6 +148,10 @@ struct ibgda_mem_object {
 	void *gpu_ptr;
 	size_t size;
     } aligned;
+    union {
+	struct bnxt_re_dv_umem *umem;
+	struct bnxt_re_dv_devx_uar *uar;
+    };
     bool has_cpu_mapping : 1;
     bool has_gpu_mapping : 1;
     bool has_nic_mapping : 1;
@@ -156,7 +160,19 @@ struct ibgda_mem_object {
 #endif
 };
 
+/* TBD - Move this to DV API */
+struct bnxt_re_dv_devx_uar {
+    struct ibv_context *context;
+    void *reg_addr;
+    uint32_t dpi_idx;
+    // TBD. Remove below
+    void *base_addr;
+    off_t mmap_off;
+    uint64_t comp_mask;
+};
+
 struct ibgda_cq {
+    struct ibv_cq *devx_cq;
     uint32_t cqn;
     uint32_t num_cqe;
     struct ibgda_mem_object *cq_mobject;
@@ -169,6 +185,10 @@ struct ibgda_ep {
     nvshmemi_ibgda_device_qp_type_t qp_type;
 
     union {
+	/* TBD
+	 * Ideally we do not require ibv_qp in DV path.
+	 */
+	struct ibv_qp *devx_qp;
 	struct ibv_qp *ib_qp;
     };
     uint32_t qpn;
@@ -180,6 +200,7 @@ struct ibgda_ep {
     off_t rq_buf_offset;
 
     struct ibgda_mem_object *wq_mobject;
+    struct ibgda_mem_object *rq_mobject;
     struct ibgda_mem_object *dbr_mobject;
     struct ibgda_mem_object *uar_mobject;
 
@@ -231,12 +252,14 @@ struct ibgda_device {
 	struct ibv_cq *send_cq;
 	struct ibv_cq *recv_cq;
 	struct ibv_ah *ah;
+	struct bnxt_re_dv_ah dah;
 	struct ibv_ah_attr ah_attr;
     } dct;
     struct {
 	struct ibv_srq *srq;
 	struct ibv_cq *recv_cq;
 	struct ibgda_mem_object *wq_mobject;
+	struct ibgda_mem_object *rq_mobject;
 	struct ibgda_mem_object *dbr_mobject;
 	struct ibgda_internal_buffer internal_buf;
 	size_t wq_buf_size_per_qp;
@@ -293,7 +316,7 @@ typedef struct {
 struct ibgda_device_local_only_mhandle_cache {
     nvshmemi_ibgda_device_local_only_mhandle_t mhandle;
     void *
-	dev_ptr;  // Ptr to GPU buffer that contains a copy of this mhandle. CPU cannot dereference.
+    dev_ptr;  // Ptr to GPU buffer that contains a copy of this mhandle. CPU cannot dereference.
 };
 
 // CPU cannot dereference next
@@ -412,11 +435,12 @@ static int get_pci_path(int dev, char **pci_path, nvshmem_transport_t t) {
     int dev_id = ibgda_state->dev_ids[dev];
     const char *ib_name =
 	(const char *)((struct ibgda_device *)ibgda_state->devices)[dev_id].dev->name;
-
-    status = nvshmemt_ib_iface_get_mlx_path(ib_name, pci_path);
+    /* TBD - Do we need below ? */
+#if 0
+    status = nvshmemt_ib_iface_get_bnxt_path(ib_name, pci_path);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "nvshmemt_ib_iface_get_mlx_path failed \n");
-
+			  "nvshmemt_ib_iface_get_bnxt_path failed \n");
+#endif
 out:
     return status;
 }
@@ -428,6 +452,7 @@ int nvshmemt_ibgda_can_reach_peer(int *access, struct nvshmem_transport_pe_info 
     *access = NVSHMEM_TRANSPORT_CAP_GPU_WRITE | NVSHMEM_TRANSPORT_CAP_GPU_READ |
 	      NVSHMEM_TRANSPORT_CAP_GPU_ATOMICS;
 
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: from %s %d \n", __func__, __LINE__);
     return status;
 }
 
@@ -437,6 +462,7 @@ int nvshmemt_ibgda_get_mem_handle(nvshmem_mem_handle_t *mem_handle,
     int status = 0;
     struct nvshmem_transport *transport = (struct nvshmem_transport *)t;
     nvshmemt_ibgda_state_t *ibgda_state = (nvshmemt_ibgda_state_t *)transport->state;
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: from %s %d \n", __func__, __LINE__);
 
     __be32 device_lkey;
     struct ibgda_mem_handle *handle;
@@ -596,18 +622,98 @@ out:
 		ibgda_state->log_level);
 	}
     }
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: from %s %d \n", __func__, __LINE__);
     return status;
 }
 
 static int ibgda_mobject_nic_map(struct ibgda_mem_object *mobject, struct ibv_context *context,
 				 uint32_t access, bool use_dmabuf = false) {
+    int status = 0;
+    void *addr;
+    struct bnxt_re_dv_umem_reg_attr attr = {
+	    0,
+    };
+    struct bnxt_re_dv_umem *umem = NULL;
 
-    NVSHMEMI_ERROR_PRINT("ibgda mobject_nic_map not implemented");
-    return NVSHMEMX_ERROR_NOT_SUPPORTED;
+    assert(mobject);
+    assert(!mobject->has_nic_mapping);
+    assert(context);
+
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: use_dmabuf %d from %s %d \n",
+			 use_dmabuf, __func__, __LINE__);
+
+    if (mobject->mem_type == IBGDA_MEM_TYPE_GPU) {
+	addr = (void *)mobject->aligned.gpu_ptr;
+    } else if (mobject->mem_type == IBGDA_MEM_TYPE_HOST) {
+	addr = mobject->aligned.cpu_ptr;
+    } else {
+	status = NVSHMEMX_ERROR_INTERNAL;
+	NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			      "invalid mem_type specified.\n");
+	assert(0);
+    }
+
+    if (use_dmabuf && mobject->mem_type == IBGDA_MEM_TYPE_GPU) {
+/* TBD - use_dmabuf is not handled */
+#if 0
+	int fd;
+	struct mlx5dv_devx_umem_in umem_in = {
+	    0,
+	};
+	const size_t host_page_size = ibgda_get_host_page_size();
+	size_t dmabuf_size = IBGDA_ROUND_UP(mobject->aligned.size, host_page_size);
+	CUCHECKGOTO(ibgda_cuda_syms,
+		    cuMemGetHandleForAddressRange(&fd, (CUdeviceptr)addr, dmabuf_size,
+						  CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0),
+		    status, out);
+	umem_in.addr = 0;
+	umem_in.size = mobject->aligned.size;
+	umem_in.access = access;
+	umem_in.pgsz_bitmap = UINT64_MAX & ~(host_page_size - 1);
+	umem_in.comp_mask = MLX5DV_UMEM_MASK_DMABUF;
+	umem_in.dmabuf_fd = fd;
+	umem = mlx5dv_devx_umem_reg_ex(context, &umem_in);
+	close(fd);
+#else
+	status = NVSHMEMX_ERROR_NOT_SUPPORTED;
+	goto out;
+#endif
+    } else {
+	attr.addr = addr;
+	attr.size = mobject->aligned.size;
+	attr.access_flags = access;
+	attr.comp_mask = BNXT_RE_DV_UMEM_FLAGS_DMABUF;
+
+	umem = (struct bnxt_re_dv_umem*) bnxt_re_dv_umem_reg(context, &attr);
+    }
+
+    if (!umem) {
+	status = NVSHMEMX_ERROR_INTERNAL;
+	goto out;
+    }
+
+    mobject->umem = umem;
+    mobject->has_nic_mapping = true;
+
+out:
+    return status;
 }
 
 static void ibgda_mobject_nic_unmap(struct ibgda_mem_object *mobject) {
-    NVSHMEMI_ERROR_PRINT("ibgda mobject_nic_map not implemented");
+    int status = 0;
+
+    assert(mobject);
+    assert(mobject->has_nic_mapping);
+    assert(mobject->mem_type != IBGDA_MEM_TYPE_NIC);
+    assert(mobject->umem);
+
+    status = bnxt_re_dv_umem_dereg(mobject->umem);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "bnxt_re_dv_`umem_dereg failed.\n");
+
+    mobject->has_nic_mapping = false;
+    mobject->umem = NULL;
+
+out:
     return;
 }
 
@@ -815,6 +921,115 @@ static void ibgda_host_mem_free(struct ibgda_mem_object *mobject) {
     free(mobject);
 }
 
+static int ibgda_nic_mem_gpu_map(struct ibgda_mem_object **pmobject, struct bnxt_re_dv_devx_uar *uar,
+				 size_t size) {
+    int status = 0;
+    bool did_host_reg = false;
+
+    void *ptr = 0;
+
+    struct ibgda_mem_object *mobject =
+	(struct ibgda_mem_object *)calloc(1, sizeof(struct ibgda_mem_object));
+    NVSHMEMI_NULL_ERROR_JMP(mobject, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+			    "Unable to allocate a new mobject.\n");
+
+    status = cudaHostRegister(
+	uar->reg_addr, size,
+	cudaHostRegisterPortable | cudaHostRegisterMapped | cudaHostRegisterIoMemory);
+
+    /* TBD Multiple DPI mapping needs to be avoided. */
+    if (status == 712) {
+	NVSHMEMI_WARN_PRINT(
+	    "BNXT_RE TBD - cudaHostRegister with IoMemory failed with error=%d.\n",
+	    status);
+	goto skip;
+    }
+
+    if (status != cudaSuccess) {
+	NVSHMEMI_WARN_PRINT(
+	    "cudaHostRegister with IoMemory failed with error=%d. We may need to use a fallback "
+	    "path.\n",
+	    status);
+	status = NVSHMEMX_ERROR_INTERNAL;
+	goto out;
+    }
+
+skip:
+    did_host_reg = true;
+
+    status = cudaHostGetDevicePointer(&ptr, uar->reg_addr, 0);
+    NVSHMEMI_NE_ERROR_JMP(status, cudaSuccess, NVSHMEMX_ERROR_INTERNAL, out,
+			  "cudaHostGetDevicePointer failed.\n");
+
+    mobject->mem_type = IBGDA_MEM_TYPE_NIC;
+
+    mobject->base.cpu_ptr = uar->reg_addr;
+    mobject->base.gpu_ptr = ptr;
+    mobject->base.size = size;
+
+    mobject->aligned.cpu_ptr = uar->reg_addr;
+    mobject->aligned.gpu_ptr = ptr;
+    mobject->aligned.size = size;
+
+    mobject->uar = uar;
+
+    mobject->has_cpu_mapping = true;
+    mobject->has_gpu_mapping = true;
+    mobject->has_nic_mapping = true;
+
+    *pmobject = mobject;
+
+out:
+    if (status) {
+	if (did_host_reg) {
+	    cudaError_t _status = cudaHostUnregister(uar->reg_addr);
+	    CUDA_RUNTIME_ERROR_STRING(_status);
+	}
+	if (mobject) free(mobject);
+    }
+    return status;
+}
+
+static void ibgda_nic_mem_gpu_unmap(struct ibgda_mem_object *mobject) {
+    cudaError_t status;
+
+    if (!mobject) return;
+
+    assert(mobject->mem_type == IBGDA_MEM_TYPE_NIC);
+
+    status = cudaHostUnregister(mobject->uar->reg_addr);
+    CUDA_RUNTIME_ERROR_STRING(status);
+
+    free(mobject);
+}
+
+static int ibgda_nic_mem_cpu_map(struct ibgda_mem_object **pmobject, struct bnxt_re_dv_devx_uar *uar,
+				 size_t size) {
+    int status = 0;
+
+    struct ibgda_mem_object *mobject =
+	(struct ibgda_mem_object *)calloc(1, sizeof(struct ibgda_mem_object));
+    NVSHMEMI_NULL_ERROR_JMP(mobject, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+			    "Unable to allocate a new mobject.\n");
+
+    mobject->mem_type = IBGDA_MEM_TYPE_NIC;
+
+    mobject->base.cpu_ptr = uar->reg_addr;
+    mobject->base.size = size;
+
+    mobject->aligned.cpu_ptr = uar->reg_addr;
+    mobject->aligned.size = size;
+
+    mobject->uar = uar;
+
+    mobject->has_cpu_mapping = true;
+    mobject->has_nic_mapping = true;
+
+    *pmobject = mobject;
+
+out:
+    return status;
+}
 
 static void ibgda_nic_mem_cpu_unmap(struct ibgda_mem_object *mobject) {
     assert(mobject->mem_type == IBGDA_MEM_TYPE_NIC);
@@ -842,13 +1057,61 @@ static inline void ibgda_nic_control_free(struct ibgda_mem_object *mobject) {
 }
 
 static int ibgda_create_cq(struct ibgda_cq **pgcq, struct ibgda_device *device) {
-    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
-    return NVSHMEMX_ERROR_NOT_SUPPORTED;
+    int status = 0;
+
+    struct bnxt_re_dv_cq_init_attr cq_dv_attr = {};
+    struct ibgda_cq *gcq = NULL;
+
+    struct ibv_pd *pd = device->pd;
+    struct ibv_context *context = pd->context;
+
+    void *cq_context;
+
+    size_t num_cqe = IBGDA_ROUND_UP_POW2_OR_0(ibgda_qp_depth);
+
+    struct bnxt_re_dv_umem *cq_umem = device->cq_shared_object.cq_mobject->umem;
+    off_t cq_offset = device->cq_shared_object.cur_cq_off;
+
+    struct bnxt_re_dv_umem *dbr_umem = device->cq_shared_object.dbr_mobject->umem;
+    off_t dbr_offset = device->cq_shared_object.cur_dbr_off;
+
+    gcq = (struct ibgda_cq *)calloc(1, sizeof(struct ibgda_cq));
+    NVSHMEMI_NULL_ERROR_JMP(gcq, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+			    "Unable to allocate mem for cq.\n");
+
+    cq_dv_attr.umem_handle = cq_umem;
+    cq_dv_attr.cq_umem_offset = cq_offset;
+    cq_dv_attr.ncqe = num_cqe;
+
+    gcq->devx_cq = bnxt_re_dv_create_cq(context, &cq_dv_attr);
+    NVSHMEMI_NULL_ERROR_JMP(gcq->devx_cq, status, NVSHMEMX_ERROR_INTERNAL, out,
+			    "Unable to create CQ.\n");
+    gcq->num_cqe = num_cqe;
+    gcq->cq_mobject = device->cq_shared_object.cq_mobject;
+    gcq->cq_offset = cq_offset;
+    gcq->dbr_mobject = device->cq_shared_object.dbr_mobject;
+    gcq->dbr_offset = dbr_offset;
+
+    device->cq_shared_object.cur_cq_off += device->cq_shared_object.cq_buf_size_per_cq;
+    device->cq_shared_object.cur_dbr_off += IBGDA_DBRSIZE;
+
+    *pgcq = gcq;
+
+out:
+    if (status) {
+	if (gcq) free(gcq);
+    }
+    return status;
 }
 
 static void ibgda_destroy_cq(struct ibgda_cq *gcq) {
-    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
-    return;
+    if (!gcq) return;
+
+    if (gcq->devx_cq) {
+	bnxt_re_dv_destroy_cq(gcq->devx_cq);
+    }
+
+    free(gcq);
 }
 
 static void ibgda_get_device_cq(nvshmemi_ibgda_device_cq_t *dev_cq, const struct ibgda_cq *cq) {
@@ -863,8 +1126,30 @@ static void ibgda_get_device_cq(nvshmemi_ibgda_device_cq_t *dev_cq, const struct
 }
 
 static int ibgda_qp_rst2init(struct ibgda_ep *ep, const struct ibgda_device *device, int portid) {
-    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
-    return NVSHMEMX_ERROR_NOT_SUPPORTED;
+    const struct ibv_port_attr *port_attr = device->port_attr + (portid - 1);
+    struct ibv_qp* ib_qp = ep->devx_qp;
+    struct ibv_qp_attr ib_qp_attr;
+    struct ib_uverbs_qp_attr ib_qp_uattr;
+    int status = 0;
+
+    memcpy(&ib_qp_attr.ah_attr, &device->dct.ah_attr, sizeof(ib_qp_attr.ah_attr));
+    // RST2INIT
+    memset(&ib_qp_attr, 0, sizeof(ib_qp_attr));
+    ib_qp_uattr.qp_state = IBV_QPS_INIT;
+    ib_qp_uattr.pkey_index = 0;
+    ib_qp_uattr.port_num = portid;
+    ib_qp_uattr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
+				  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
+    ib_qp_uattr.qp_attr_mask = (IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+				IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+
+    status = bnxt_re_dv_modify_qp(ib_qp, &ib_qp_uattr, 0, 0);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			 "bnxt_re_dv_modify_qp rst2init for dci failed.\n");
+    ep->portid = portid;
+
+out:
+    return status;
 }
 
 static int ibgda_dci_init2rtr(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_ep *ep,
@@ -873,16 +1158,127 @@ static int ibgda_dci_init2rtr(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_
     return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
+
 static int ibgda_rc_init2rtr(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_ep *ep,
 			     const struct ibgda_device *device, int portid,
 			     struct ibgda_rc_handle *peer_ep_handle) {
-    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
-    return NVSHMEMX_ERROR_NOT_SUPPORTED;
+    int status = 0;
+    struct ib_uverbs_qp_attr ib_qp_uattr = {};
+    struct ibv_qp_attr attr = {};
+    int flags;
+    __u8 *gid_raw;
+
+    const struct ibv_port_attr *port_attr = device->port_attr + (portid - 1);
+
+    assert(ep->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC);
+
+    if (port_attr->link_layer == IBV_LINK_LAYER_ETHERNET) {
+
+	const char *nic_device_name = ftable.get_device_name(device->context->device);
+
+	ib_get_gid_index(&ftable, device->context, portid, port_attr->gid_tbl_len,
+			 (int *)&device->gid_info[portid - 1].local_gid_index,
+			 ibgda_state->log_level, ibgda_state->options);
+	ftable.query_gid(device->context, portid, device->gid_info[portid - 1].local_gid_index,
+			 (ibv_gid *)&device->gid_info[portid - 1].local_gid);
+
+	ib_qp_uattr.alt_ah_attr.is_global = 0;
+
+	ib_qp_uattr.qp_state = IBV_QPS_RTR;
+	ib_qp_uattr.path_mtu = port_attr->active_mtu;
+	ib_qp_uattr.min_rnr_timer = 12;
+	ib_qp_uattr.dest_qp_num = ep->qpn;
+	ib_qp_uattr.rq_psn = 0;
+	//ib_qp_uattr.max_dest_rd_atomic = NVSHMEMT_IBRC_MAX_RD_ATOMIC;
+	ib_qp_uattr.max_dest_rd_atomic = 126;
+	ib_qp_uattr.ah_attr.sl = ibgda_state->options->IB_SL;
+	ib_qp_uattr.ah_attr.src_path_bits = 0;
+	ib_qp_uattr.ah_attr.port_num = portid;
+	/* TBD - ROCEV2 only */
+	ib_qp_uattr.ah_attr.dlid = port_attr->lid | (IBGDA_ROCE_V2_UDP_SPORT_BASE);
+	ib_qp_uattr.ah_attr.is_global = 1;
+	//ib_qp_uattr.ah_attr.grh.dgid.global.subnet_prefix = peer_ep_handle->spn;
+	//ib_qp_uattr.ah_attr.grh.dgid.global.interface_id = peer_ep_handle->iid;
+	gid_raw = ib_qp_uattr.ah_attr.grh.dgid;
+	memcpy(gid_raw, &peer_ep_handle->spn, 8);
+	gid_raw = gid_raw + 8;
+	memcpy(gid_raw, &peer_ep_handle->iid, 8);
+
+
+	ib_qp_uattr.ah_attr.grh.sgid_index = device->gid_info[portid - 1].local_gid_index;
+	ib_qp_uattr.ah_attr.grh.traffic_class = ibgda_state->options->IB_TRAFFIC_CLASS;
+
+	ib_qp_uattr.pkey_index = 0;
+	ib_qp_uattr.port_num = portid;
+	ib_qp_uattr.qp_attr_mask = (IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+				    IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MIN_RNR_TIMER |
+				    IBV_QP_MAX_DEST_RD_ATOMIC);
+
+
+
+
+
+	attr.alt_ah_attr.is_global = 0;
+	attr.qp_state = IBV_QPS_RTR;
+	attr.path_mtu = port_attr->active_mtu;
+	attr.min_rnr_timer = 12;
+	attr.dest_qp_num = ep->qpn;
+	attr.rq_psn = 0;
+	//ib_qp_uattr.max_dest_rd_atomic = NVSHMEMT_IBRC_MAX_RD_ATOMIC;
+	attr.max_dest_rd_atomic = 126;
+	attr.ah_attr.sl = ibgda_state->options->IB_SL;
+	attr.ah_attr.src_path_bits = 0;
+	attr.ah_attr.port_num = portid;
+	/* TBD - ROCEV2 only */
+	attr.ah_attr.dlid = port_attr->lid | (IBGDA_ROCE_V2_UDP_SPORT_BASE);
+	attr.ah_attr.is_global = 1;
+	attr.ah_attr.grh.dgid.global.subnet_prefix = peer_ep_handle->spn;
+	attr.ah_attr.grh.dgid.global.interface_id = peer_ep_handle->iid;
+	attr.ah_attr.grh.sgid_index = device->gid_info[portid - 1].local_gid_index;
+	attr.ah_attr.grh.traffic_class = ibgda_state->options->IB_TRAFFIC_CLASS;
+
+	attr.pkey_index = 0;
+	attr.port_num = portid;
+	flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+		IBV_QP_MIN_RNR_TIMER | IBV_QP_MAX_DEST_RD_ATOMIC;
+
+	//status = ftable.modify_qp(ep->devx_qp, &attr, flags);
+	//NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "GPU1 ibv_modify_qp failed \n");
+    }
+
+    status = bnxt_re_dv_modify_qp(ep->devx_qp, &ib_qp_uattr, 0, 0);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			  "GPU1 Error in bnxt_re_dv_modify_qp for INIT2RTR_QP peer qpn %d \n", ep->qpn);
+
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: from %s %d \n", __func__, __LINE__);
+out:
+    return status;
 }
 
 static int ibgda_qp_rtr2rts(struct ibgda_ep *ep, const struct ibgda_device *device, int portid) {
-    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
-    return NVSHMEMX_ERROR_NOT_SUPPORTED;
+
+    int status = 0;
+    struct ib_uverbs_qp_attr ib_qp_uattr = {};
+
+    memset(&ib_qp_uattr, 0, sizeof(struct ib_uverbs_qp_attr));
+    ib_qp_uattr.qp_state = IBV_QPS_RTS;
+    ib_qp_uattr.sq_psn = 0;
+    ib_qp_uattr.timeout = 20;
+    ib_qp_uattr.retry_cnt = 7;
+    ib_qp_uattr.rnr_retry = 7;
+    ib_qp_uattr.max_rd_atomic = 7;
+
+    ib_qp_uattr.qp_attr_mask = (IBV_QP_STATE | IBV_QP_SQ_PSN |
+				IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+				IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC);
+
+    status = bnxt_re_dv_modify_qp(ep->devx_qp, &ib_qp_uattr, 0, 0);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			  "GPU1 Error in bnxt_re_dv_modify_qp for RTR2RTS_QP peer qpn %d \n", ep->qpn);
+
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: from %s %d \n", __func__, __LINE__);
+out:
+    return status;
 }
 
 static int ibgda_destroy_internal_buffer(nvshmemt_ibgda_state_t *ibgda_state,
@@ -1012,6 +1408,12 @@ static int ibgda_destroy_qp_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
 	ibgda_nic_control_free(device->qp_shared_object.wq_mobject);
     }
 
+    if (device->qp_shared_object.rq_mobject) {
+	if (device->qp_shared_object.rq_mobject->has_nic_mapping)
+	    ibgda_mobject_nic_unmap(device->qp_shared_object.rq_mobject);
+	ibgda_nic_control_free(device->qp_shared_object.rq_mobject);
+    }
+
 out:
     return status;
 }
@@ -1075,28 +1477,385 @@ out:
 
 static int ibgda_create_qp_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
 					  struct ibgda_device *device, int n_pes) {
-    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
-    return NVSHMEMX_ERROR_NOT_SUPPORTED;
+    int status = 0;
+
+    struct ibv_context *context = device->context;
+    struct ibv_pd *pd = device->pd;
+
+    struct ibv_srq *srq = NULL;
+    struct ibv_srq_init_attr srq_init_attr;
+
+    struct ibv_cq *recv_cq = NULL;
+
+    struct ibgda_mem_object *prod_idx_mobject = NULL;
+    uint64_t *prod_idx_cache = NULL;
+    uint64_t *prod_idx_snapshot = NULL;
+    unsigned int num_eps = device->dci.num_eps + device->rc.num_eps_per_pe * n_pes;
+
+    bnxt_re_dv_obj dv_obj;
+    struct bnxt_re_dv_pd dvpd;
+    struct bnxt_re_dv_cq dvscq;
+    struct bnxt_re_dv_cq dvrcq;
+    struct bnxt_re_dv_srq dvsrq;
+
+    int pdn = 0;
+    int srqn = 0;
+    int rcqn = 0;
+
+    assert(ibgda_qp_depth > 0);
+    size_t num_wqebb = IBGDA_ROUND_UP_POW2_OR_0(ibgda_qp_depth);
+
+    size_t wq_buf_size_per_qp;
+    size_t wq_buf_size;
+    struct ibgda_mem_object *wq_mobject = NULL;
+    struct ibgda_mem_object *rq_mobject = NULL;
+
+    size_t dbr_buf_size;
+    struct ibgda_mem_object *dbr_mobject = NULL;
+
+    // Initialization
+    memset(&srq_init_attr, 0, sizeof(srq_init_attr));
+    memset(&dvpd, 0, sizeof(dvpd));
+    memset(&dvscq, 0, sizeof(dvscq));
+    memset(&dvrcq, 0, sizeof(dvrcq));
+    memset(&dvsrq, 0, sizeof(dvsrq));
+
+    // Query pdn
+    memset(&dv_obj, 0, sizeof(dv_obj));
+    dv_obj.pd.in = pd;
+    dv_obj.pd.out = &dvpd;
+
+    status = bnxt_re_dv_init_obj(&dv_obj, BNXT_RE_DV_OBJ_PD);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			  "bnxt_re_dv PD initialization failed.\n");
+
+    pdn = dvpd.pdn;
+
+    // Create srq on host memory.
+    srq_init_attr.attr.max_wr = ibgda_srq_depth;
+    srq_init_attr.attr.max_sge = 1;
+
+    srq = ftable.create_srq(pd, &srq_init_attr);
+    NVSHMEMI_NULL_ERROR_JMP(srq, status, NVSHMEMX_ERROR_INTERNAL, out, "ibv_create_srq failed.\n");
+
+    memset(&dv_obj, 0, sizeof(dv_obj));
+    //dvsrq.comp_mask = BNXT_RE_DV_SRQ_MASK_SRQN;
+    dv_obj.srq.in = srq;
+    dv_obj.srq.out = &dvsrq;
+
+    status = bnxt_re_dv_init_obj(&dv_obj, BNXT_RE_DV_OBJ_SRQ);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			  "bnxt_re_dv SRQ initialization failed.\n");
+
+    srqn = dvsrq.srqn;
+    NVSHMEMI_EQ_ERROR_JMP(srqn, 0, NVSHMEMX_ERROR_INTERNAL, out,
+			  "Unable to allocate SRQ for your device. "
+			  "This may occur if your ofed is older than version 5.0.\n");
+
+    // Create recv_cq on host memory.
+    recv_cq = ftable.create_cq(context, ibgda_srq_depth, NULL, NULL, 0);
+    NVSHMEMI_NULL_ERROR_JMP(recv_cq, status, NVSHMEMX_ERROR_INTERNAL, out,
+			    "ibv_create_cq for recv_cq failed.\n");
+
+    memset(&dv_obj, 0, sizeof(dv_obj));
+    dv_obj.cq.in = recv_cq;
+    dv_obj.cq.out = &dvrcq;
+
+    status = bnxt_re_dv_init_obj(&dv_obj, BNXT_RE_DV_OBJ_CQ);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			  "bnxt_re_dv RCQ initialization failed.\n");
+
+    rcqn = dvrcq.cqn;
+
+    status = ibgda_create_internal_buffer(&device->qp_shared_object.internal_buf, ibgda_state,
+					  device, n_pes);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			  "ibgda_create_internal_buffer failed.\n");
+
+    if (ibgda_nic_handler == IBGDA_NIC_HANDLER_CPU) {
+	status = ibgda_gpu_mem_alloc(&prod_idx_mobject, sizeof(uint64_t) * num_eps,
+				     IBGDA_GPAGE_SIZE, true);
+	NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			      "cannot allocate prod_idx_mobject.\n");
+
+	prod_idx_cache = (uint64_t *)calloc(num_eps, sizeof(uint64_t));
+	NVSHMEMI_NULL_ERROR_JMP(prod_idx_cache, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+				"Unable to allocate mem for prod_idx_cache.\n");
+
+	prod_idx_snapshot = (uint64_t *)calloc(num_eps, sizeof(uint64_t));
+	NVSHMEMI_NULL_ERROR_JMP(prod_idx_snapshot, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+				"Unable to allocate mem for prod_idx_snapshot.\n");
+    }
+
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: pdn %d srqn %d rcqn %d from %s %d \n",
+			 pdn, srqn, rcqn, __func__, __LINE__);
+
+    // Allocate and map WQ buffer for all QPs.
+    wq_buf_size_per_qp = num_wqebb * BNXT_SEND_WQE_BB;  // num_wqebb is always a power of 2
+    wq_buf_size = wq_buf_size_per_qp * num_eps;
+    status = ibgda_nic_control_alloc(&wq_mobject, wq_buf_size, IBGDA_GPAGE_SIZE);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot allocate wq buf.\n");
+
+    status = ibgda_mobject_nic_map(wq_mobject, context, IBV_ACCESS_LOCAL_WRITE,
+				   ibgda_state->dmabuf_support_for_control_buffers);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot register wq buf.\n");
+
+    // Allocate and map RQ buffer for all QPs.
+    wq_buf_size_per_qp = num_wqebb * BNXT_SEND_WQE_BB;  // num_wqebb is always a power of 2
+    wq_buf_size = wq_buf_size_per_qp * num_eps;
+    status = ibgda_nic_control_alloc(&rq_mobject, wq_buf_size, IBGDA_GPAGE_SIZE);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot allocate wq buf.\n");
+
+    status = ibgda_mobject_nic_map(rq_mobject, context, IBV_ACCESS_LOCAL_WRITE,
+				   ibgda_state->dmabuf_support_for_control_buffers);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot register wq buf.\n");
+
+    // Allocate and map Doorbell Record buffer for all QPs.
+    dbr_buf_size = IBGDA_DBRSIZE * num_eps;
+    if (ibgda_nic_handler == IBGDA_NIC_HANDLER_GPU)
+	status = ibgda_nic_control_alloc(&dbr_mobject, dbr_buf_size, IBGDA_GPAGE_SIZE);
+    else
+	status = ibgda_host_mem_alloc(&dbr_mobject, dbr_buf_size, IBGDA_GPAGE_SIZE, true);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot allocate dbr buf.\n");
+
+    status = ibgda_mobject_nic_map(dbr_mobject, context, IBV_ACCESS_LOCAL_WRITE,
+				   ibgda_state->dmabuf_support_for_control_buffers);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot register dbr buf.\n");
+
+    // Output
+    device->qp_shared_object.srq = srq;
+    device->qp_shared_object.recv_cq = recv_cq;
+    device->qp_shared_object.pdn = pdn;
+    device->qp_shared_object.srqn = srqn;
+    device->qp_shared_object.rcqn = rcqn;
+    device->qp_shared_object.prod_idx_mobject = prod_idx_mobject;
+    device->qp_shared_object.prod_idx_cache = prod_idx_cache;
+    device->qp_shared_object.prod_idx_snapshot = prod_idx_snapshot;
+    device->qp_shared_object.wq_buf_size_per_qp = wq_buf_size_per_qp;
+    device->qp_shared_object.wq_mobject = wq_mobject;
+    device->qp_shared_object.rq_mobject = rq_mobject;
+    device->qp_shared_object.dbr_mobject = dbr_mobject;
+
+out:
+    if (status) {
+	if (dbr_mobject) {
+	    if (dbr_mobject->has_nic_mapping) ibgda_mobject_nic_unmap(dbr_mobject);
+	    ibgda_nic_control_free(dbr_mobject);
+	}
+	if (wq_mobject) {
+	    if (wq_mobject->has_nic_mapping) ibgda_mobject_nic_unmap(wq_mobject);
+	    ibgda_nic_control_free(wq_mobject);
+	}
+	if (rq_mobject) {
+	    if (rq_mobject->has_nic_mapping) ibgda_mobject_nic_unmap(rq_mobject);
+	    ibgda_nic_control_free(rq_mobject);
+	}
+	if (recv_cq) ftable.destroy_cq(recv_cq);
+	if (srq) ftable.destroy_srq(srq);
+	if (prod_idx_mobject) ibgda_gpu_mem_free(prod_idx_mobject);
+	if (prod_idx_cache) free(prod_idx_cache);
+	if (prod_idx_snapshot) free(prod_idx_snapshot);
+    }
+    return status;
 }
 
 static int ibgda_alloc_and_map_qp_uar(struct ibv_context *context, ibgda_nic_handler_t handler,
 				      struct ibgda_mem_object **out_mobject) {
-    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
-    return NVSHMEMX_ERROR_NOT_SUPPORTED;
+    int status = 0;
+
+    struct bnxt_re_dv_devx_uar *uar = NULL;
+    struct ibgda_mem_object *uar_mobject = NULL;
+    size_t uar_reg_size = 0;
+    uint8_t log_bf_reg_size = 0;
+
+    struct bnxt_re_dv_dbr_attr attr = {};
+    memset(&attr, 0, sizeof(struct bnxt_re_dv_dbr_attr));
+
+    /* allocate host memory for dct, rc, cq, dci start */
+    uar = (struct bnxt_re_dv_devx_uar *)malloc(sizeof(struct bnxt_re_dv_devx_uar));
+    NVSHMEMI_NULL_ERROR_JMP(uar, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out, "bnxt_re uar err.");
+
+    if (bnxt_re_dv_get_default_dbr(context, &attr)) {
+	    NVSHMEMI_WARN_PRINT(
+		"GPU1: bnxt_re_dv_get_default_dbr failed.\n");
+	    status = NVSHMEMX_ERROR_INTERNAL;
+	    goto out;
+    }
+    uar->reg_addr = (void*)attr.dbr;
+    uar->context  = context;
+
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: dpi 0x%lx dpi_id 0x%x from %s %d \n",
+			 uar->reg_addr, uar->dpi_idx, __func__, __LINE__);
+    // TBD - Hardcoding
+    log_bf_reg_size = 16;
+    uar_reg_size = 1LLU << log_bf_reg_size;
+    uar_reg_size = 1LLU << IBGDA_BNXT_NC_UAR_SIZE;
+
+    // Map the UAR to GPU
+    if (handler == IBGDA_NIC_HANDLER_GPU) {
+	status = ibgda_nic_mem_gpu_map(&uar_mobject, uar, uar_reg_size);
+	if (status) {
+	    NVSHMEMI_WARN_PRINT(
+		"ibgda_nic_mem_gpu_map failed. We may need to use the CPU fallback path.\n");
+	    status = NVSHMEMX_ERROR_INTERNAL;
+	    goto out;
+	}
+    } else {
+	status = ibgda_nic_mem_cpu_map(&uar_mobject, uar, uar_reg_size);
+	NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			      "ibgda_nic_mem_cpu_map failed.\n");
+    }
+
+    *out_mobject = uar_mobject;
+
+out:
+    if (status) {
+	if (uar_mobject) {
+	    if (handler == IBGDA_NIC_HANDLER_GPU)
+		ibgda_nic_mem_gpu_unmap(uar_mobject);
+	    else
+		ibgda_nic_mem_cpu_unmap(uar_mobject);
+	}
+	if (uar) {
+		NVSHMEMI_WARN_PRINT("IBGDA_BNXT: dpi 0x%lx dpi_id 0x%x from %s %d \n",
+				     uar->reg_addr, uar->dpi_idx, __func__, __LINE__);
+		free(uar);
+	}
+    }
+    return status;
 }
 
 static void ibgda_unmap_and_free_qp_uar(struct ibgda_mem_object *mobject) {
-    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
+    struct bnxt_re_dv_devx_uar *uar = NULL;
+
+    if (!mobject) return;
+
+    uar = mobject->uar;
+
+    if (mobject->has_gpu_mapping)
+	ibgda_nic_mem_gpu_unmap(mobject);
+    else
+	ibgda_nic_mem_cpu_unmap(mobject);
+
+    if (uar) {
+	 NVSHMEMI_WARN_PRINT("IBGDA_BNXT: dpi 0x%lx dpi_id 0x%x from %s %d \n",
+			      uar->reg_addr, uar->dpi_idx, __func__, __LINE__);
+	free(uar);
+    }
 }
 
 /**
- * Create a RC or DCI QP.
+ * Create a RC or DCI QP. DCI is dummy for IBGDA_BNXT.
  * DCT creation is not handled by this function.
  */
 static int ibgda_create_qp(struct ibgda_ep **ep_ptr, struct ibgda_device *device, int portid,
 			   uint32_t qp_idx, nvshmemi_ibgda_device_qp_type_t qp_type) {
-    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
-    return NVSHMEMX_ERROR_NOT_SUPPORTED;
+    struct ibv_pd *pd = device->pd;
+    struct ibv_context *context = pd->context;
+    struct ibgda_ep *ep = NULL;
+    struct bnxt_re_dv_qp_init_attr dv_qp_attr = {};
+
+    void *qp_context;
+
+    struct ibgda_mem_object *uar_mobject = NULL;
+
+    struct bnxt_re_dv_umem *wq_umem = NULL;
+    off_t wq_offset = 0;
+
+    struct bnxt_re_dv_umem *rq_umem = NULL;
+    off_t rq_offset = 0;
+
+    struct bnxt_re_dv_umem *dbr_umem = NULL;
+    off_t dbr_offset = 0;
+
+    int cqe_version = 0;
+
+    struct ibgda_cq *send_cq = NULL;
+
+    size_t num_wqebb = IBGDA_ROUND_UP_POW2_OR_0(ibgda_qp_depth);
+
+    int status = 0;
+
+    assert(qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI ||
+	   qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC);
+
+    INFO(5, "IBGDA_BNXT: from %s %d", __func__, __LINE__);
+    // Create send_cq on GPU memory.
+    status = ibgda_create_cq(&send_cq, device);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "ibgda_create_cq failed.\n");
+
+    ep = (struct ibgda_ep *)calloc(1, sizeof(struct ibgda_ep));
+    NVSHMEMI_NULL_ERROR_JMP(ep, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+			    "Unable to allocate mem for ep.\n");
+
+    // Allocate and map UAR. This will be used as a DB/BF register.
+    status = ibgda_alloc_and_map_qp_uar(context, ibgda_nic_handler, &uar_mobject);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			  "ibgda_alloc_and_map_qp_uar failed\n");
+
+    wq_umem = device->qp_shared_object.wq_mobject->umem;
+    wq_offset = device->qp_shared_object.cur_wq_off;
+
+    rq_umem = device->qp_shared_object.rq_mobject->umem;
+    rq_offset = device->qp_shared_object.cur_wq_off;
+
+    dbr_umem = device->qp_shared_object.dbr_mobject->umem;
+    dbr_offset = device->qp_shared_object.cur_dbr_off;
+
+    dv_qp_attr.qp_type = IBV_QPT_RC;
+    dv_qp_attr.max_send_wr = num_wqebb;
+    // TBD - Hardcoding
+    dv_qp_attr.max_recv_wr = 1;
+    dv_qp_attr.max_send_sge = 1;
+    dv_qp_attr.max_recv_sge = 1;
+    // TBD - Hardcoding
+    dv_qp_attr.max_inline_data = 96;
+    dv_qp_attr.sq_umem_handle = wq_umem;
+    dv_qp_attr.rq_umem_handle = rq_umem;
+    dv_qp_attr.send_cq = send_cq->devx_cq;
+    // TBD - Use srq
+    dv_qp_attr.recv_cq = device->qp_shared_object.recv_cq;
+
+    ep->devx_qp = bnxt_re_dv_create_qp(device->dct.pd, &dv_qp_attr);
+
+    NVSHMEMI_NULL_ERROR_JMP(ep->devx_qp, status, NVSHMEMX_ERROR_INTERNAL, out,
+			    "GPU1 Unable to create QP for EP.\n");
+    ep->portid = portid;
+
+    ep->sq_cnt = num_wqebb;
+    ep->sq_buf_offset = 0;
+
+    ep->rq_cnt = 0;
+    ep->rq_buf_offset = 0;
+
+    ep->wq_mobject = device->qp_shared_object.wq_mobject;
+    ep->rq_mobject = device->qp_shared_object.rq_mobject;
+    ep->wq_offset = wq_offset;
+    device->qp_shared_object.cur_wq_off += device->qp_shared_object.wq_buf_size_per_qp;
+
+    ep->dbr_mobject = device->qp_shared_object.dbr_mobject;
+    ep->dbr_offset = dbr_offset;
+    device->qp_shared_object.cur_dbr_off += IBGDA_DBRSIZE;
+
+    ep->uar_mobject = uar_mobject;
+
+    ep->send_cq = send_cq;
+
+    ep->qp_type = qp_type;
+
+    ep->user_index = qp_idx;
+    ep->qpn = ep->devx_qp->qp_num;
+
+    *ep_ptr = ep;
+
+out:
+    if (status) {
+	if (uar_mobject) ibgda_unmap_and_free_qp_uar(uar_mobject);
+	if (send_cq) ibgda_destroy_cq(send_cq);
+	if (ep) free(ep);
+    }
+
+    return status;
 }
 
 static int ibgda_get_rc_handle(struct ibgda_rc_handle *rc_handle, const struct ibgda_ep *ep,
@@ -1111,6 +1870,9 @@ static int ibgda_get_rc_handle(struct ibgda_rc_handle *rc_handle, const struct i
     if (rc_handle->lid == 0) {
 	rc_handle->spn = gid->global.subnet_prefix;
 	rc_handle->iid = gid->global.interface_id;
+
+	NVSHMEMI_WARN_PRINT("IBGDA_BNXT: spn %lx iid %lx from %s %d \n",
+			     rc_handle->spn, rc_handle->iid, __func__, __LINE__);
     }
 
     return 0;
@@ -1151,14 +1913,210 @@ out:
 
 static int ibgda_create_dct_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
 					   struct ibgda_device *device, int portid) {
-    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
-    return NVSHMEMX_ERROR_NOT_SUPPORTED;
+    int status = 0;
+
+    const struct ibv_port_attr *port_attr = device->port_attr + (portid - 1);
+    struct ibv_context *context = device->context;
+
+    struct ibv_pd *pd = NULL;
+    struct ibv_parent_domain_init_attr pd_init_attr;
+
+    struct ibv_srq *srq = NULL;
+    struct ibv_srq_init_attr srq_init_attr;
+
+    struct ibv_cq *send_cq = NULL;
+    struct ibv_cq *recv_cq = NULL;
+
+    struct ibv_ah *ah = NULL;
+    struct bnxt_re_dv_ah dah;
+    struct ibv_ah_attr ah_attr;
+    struct bnxt_re_dv_obj dv;
+
+    bool support_half_av_seg;
+    int hca_support_compact_address_vector;
+
+    // TBD
+    hca_support_compact_address_vector = 0;
+
+    memset(&pd_init_attr, 0, sizeof(pd_init_attr));
+    memset(&srq_init_attr, 0, sizeof(srq_init_attr));
+
+#if 0
+    // TBD -
+    pd_init_attr.pd = device->pd;
+    pd = ibv_alloc_parent_domain(context, &pd_init_attr);
+    NVSHMEMI_NULL_ERROR_JMP(pd, status, NVSHMEMX_ERROR_INTERNAL, out,
+			    "ibv_alloc_parent_domain failed.\n");
+#endif
+    pd = device->pd;
+
+    srq_init_attr.attr.max_wr = ibgda_srq_depth;
+    srq_init_attr.attr.max_sge = 1;
+
+    srq = ftable.create_srq(pd, &srq_init_attr);
+    NVSHMEMI_NULL_ERROR_JMP(srq, status, NVSHMEMX_ERROR_INTERNAL, out, "ibv_create_srq failed.\n");
+
+    send_cq = ftable.create_cq(context, ibgda_srq_depth, NULL, NULL, 0);
+    NVSHMEMI_NULL_ERROR_JMP(send_cq, status, NVSHMEMX_ERROR_INTERNAL, out,
+			    "ibv_create_cq for send_cq failed.\n");
+
+    recv_cq = ftable.create_cq(context, ibgda_srq_depth, NULL, NULL, 0);
+    NVSHMEMI_NULL_ERROR_JMP(recv_cq, status, NVSHMEMX_ERROR_INTERNAL, out,
+			    "ibv_create_cq for recv_cq failed.\n");
+
+    if (port_attr->lid == 0) {
+	ib_get_gid_index(&ftable, device->context, portid, port_attr->gid_tbl_len,
+			 (int *)&device->gid_info[portid - 1].local_gid_index,
+			 ibgda_state->log_level, ibgda_state->options);
+	ftable.query_gid(device->context, portid, device->gid_info[portid - 1].local_gid_index,
+			 (ibv_gid *)&device->gid_info[portid - 1].local_gid);
+	ah_attr.is_global = 1;
+	ah_attr.grh.dgid.global.subnet_prefix =
+	    device->gid_info[portid - 1].local_gid.global.subnet_prefix;
+	ah_attr.grh.dgid.global.interface_id =
+	    device->gid_info[portid - 1].local_gid.global.interface_id;
+	ah_attr.grh.flow_label = 0;
+	ah_attr.grh.sgid_index = device->gid_info[portid - 1].local_gid_index;
+	ah_attr.grh.traffic_class = ibgda_state->options->IB_TRAFFIC_CLASS;
+	ah_attr.grh.hop_limit = IBGDA_GRH_HOP_LIMIT;
+	support_half_av_seg = false;
+    } else {
+	// Only IB supports is_global = 0.
+	assert(port_attr->link_layer == IBV_LINK_LAYER_INFINIBAND);
+	ah_attr.dlid = port_attr->lid;
+	ah_attr.is_global = 0;
+	support_half_av_seg = hca_support_compact_address_vector;
+    }
+    ah_attr.sl = ibgda_state->options->IB_SL;
+    ah_attr.src_path_bits = 0;
+    ah_attr.port_num = portid;
+
+    ah = ftable.create_ah(device->pd, &ah_attr);
+    NVSHMEMI_NULL_ERROR_JMP(ah, status, NVSHMEMX_ERROR_INTERNAL, out, "Unable to create ah.\n");
+
+    dv.ah.in = ah;
+    dv.ah.out = &dah;
+    bnxt_re_dv_init_obj(&dv, BNXT_RE_DV_OBJ_AH);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			  "bnxt_re_dv AH initialization failed.\n");
+
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: AH ID %d from %s %d \n", dah.avid, __func__, __LINE__);
+
+    device->dct.pd = pd;
+    device->dct.srq = srq;
+    device->dct.send_cq = send_cq;
+    device->dct.recv_cq = recv_cq;
+    device->dct.ah = ah;
+    memcpy(&device->dct.dah, &dah, sizeof(dah));
+    memcpy(&device->dct.ah_attr, &ah_attr, sizeof(ah_attr));
+    device->support_half_av_seg = support_half_av_seg;
+
+out:
+    if (status) {
+	if (recv_cq) ftable.destroy_cq(recv_cq);
+	if (send_cq) ftable.destroy_cq(send_cq);
+	if (srq) ftable.destroy_srq(srq);
+    }
+    return status;
 }
 
 static int ibgda_create_dct(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_ep **ep_ptr,
 			    const struct ibgda_device *device, int portid) {
-    NVSHMEMI_ERROR_PRINT("ibgda progress not implemented");
-    return NVSHMEMX_ERROR_NOT_SUPPORTED;
+    int status = 0;
+
+    struct ibgda_ep *ep = NULL;
+    struct ibv_qp *ib_qp = NULL;
+
+    struct ibv_qp_init_attr_ex ib_qp_attr_ex;
+    struct ibv_qp_init_attr init_attr;
+    struct ibv_qp_attr ib_qp_attr;
+    struct bnxt_re_dv_qp_init_attr dv_qp_attr = {};
+
+    const struct ibv_port_attr *port_attr = device->port_attr + (portid - 1);
+
+    memset(&ib_qp_attr_ex, 0, sizeof(ib_qp_attr_ex));
+
+    ep = (struct ibgda_ep *)calloc(1, sizeof(struct ibgda_ep));
+    NVSHMEMI_NULL_ERROR_JMP(ep, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+			    "Unable to allocate mem for ep.\n");
+
+    ib_qp_attr_ex.pd = device->dct.pd;
+    ib_qp_attr_ex.comp_mask = IBV_QP_INIT_ATTR_PD;
+    /* Note - This is dummy for IBGDA_BNXT.
+     * Use NVSHMEM_IBGDA_NUM_DCT=0
+     */
+    ib_qp_attr_ex.qp_type = IBV_QPT_RC; /* IBV_QPT_DRIVER type is used in orig. */
+    ib_qp_attr_ex.srq = device->dct.srq;
+    ib_qp_attr_ex.send_cq = device->dct.send_cq;
+    ib_qp_attr_ex.recv_cq = device->dct.recv_cq;
+
+    ib_qp_attr_ex.cap.max_send_wr = ibgda_state->options->QP_DEPTH;
+    ib_qp_attr_ex.cap.max_recv_wr = ibgda_state->options->QP_DEPTH;
+    ib_qp_attr_ex.cap.max_send_sge = 1;
+    ib_qp_attr_ex.cap.max_recv_sge = 1;
+    ib_qp_attr_ex.cap.max_inline_data = NVSHMEMI_IBGDA_MAX_INLINE_SIZE;
+
+    dv_qp_attr.qp_type = ib_qp_attr_ex.qp_type;
+    dv_qp_attr.max_send_wr = ib_qp_attr_ex.cap.max_send_wr;
+    dv_qp_attr.max_recv_wr = ib_qp_attr_ex.cap.max_recv_wr;
+    dv_qp_attr.max_send_sge = ib_qp_attr_ex.cap.max_send_sge;
+    dv_qp_attr.max_recv_sge = ib_qp_attr_ex.cap.max_recv_sge;
+
+    // TBD - Hardcoding
+    ib_qp_attr_ex.cap.max_inline_data = 96;
+    dv_qp_attr.max_inline_data = ib_qp_attr_ex.cap.max_inline_data;
+    dv_qp_attr.send_cq = ib_qp_attr_ex.send_cq;
+    dv_qp_attr.recv_cq = ib_qp_attr_ex.recv_cq;
+
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: context %lx %lx from %s %d \n",
+			 device->context, device->dct.pd->context, __func__, __LINE__);
+    ib_qp = bnxt_re_dv_create_qp(device->dct.pd, &dv_qp_attr);
+
+    NVSHMEMI_NULL_ERROR_JMP(ib_qp, status, NVSHMEMX_ERROR_INTERNAL, out,
+			    "bnxt_re_dv_create_qp failed.\n");
+
+    // RST2INIT
+    memset(&ib_qp_attr, 0, sizeof(ib_qp_attr));
+    ib_qp_attr.qp_state = IBV_QPS_INIT;
+    ib_qp_attr.pkey_index = 0;
+    ib_qp_attr.port_num = portid;
+    ib_qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
+				 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
+
+    status = ftable.modify_qp(ib_qp, &ib_qp_attr,
+			      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			  "ibv_modify_qp rst2init for dct failed.\n");
+
+    // INIT2RTR
+    memset(&ib_qp_attr, 0, sizeof(ib_qp_attr));
+    ib_qp_attr.qp_state = IBV_QPS_RTR;
+    ib_qp_attr.path_mtu = port_attr->active_mtu;
+    ib_qp_attr.min_rnr_timer = 12;
+    memcpy(&ib_qp_attr.ah_attr, &device->dct.ah_attr, sizeof(ib_qp_attr.ah_attr));
+
+    status = ftable.modify_qp(ib_qp, &ib_qp_attr,
+			      IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_MIN_RNR_TIMER);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+			  "ibv_modify_qp init2rtr for dct failed.\n");
+
+    ep->qp_type = NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCT;
+
+    ep->ib_qp = ib_qp;
+    ep->qpn = ib_qp->qp_num;
+    ep->portid = portid;
+
+    *ep_ptr = ep;
+
+out:
+    if (status) {
+	if (ib_qp) {
+	    int _status = ftable.destroy_qp(ib_qp);
+	    if (_status) NVSHMEMI_ERROR_PRINT("ibv_destroy_qp for dct failed.\n");
+	}
+	if (ep) free(ep);
+    }
+    return status;
 }
 
 static int ibgda_get_dct_handle(struct ibgda_dct_handle *dct_handle, const struct ibgda_ep *ep,
@@ -1184,7 +2142,9 @@ static int ibgda_destroy_ep(struct ibgda_ep *ep) {
 	    if (status) NVSHMEMI_ERROR_PRINT("ibv_destroy_qp failed.\n");
 	}
     } else {
-	    /* TBD */
+	if (ep->devx_qp) {
+	    bnxt_re_dv_destroy_qp(ep->devx_qp);
+	}
     }
 
     if (ep->send_cq) {
@@ -1508,14 +2468,17 @@ static int ibgda_setup_gpu_state(nvshmem_transport_t t) {
     ibgda_device_state_h->globalmem.dcts = dct_d;
     ibgda_device_state_h->globalmem.cqs = cq_d;
 
+    INFO(5, "IBGDA_BNXT from %s %d num_dct_handles %d",
+	 __func__, __LINE__, num_dct_handles);
     ibgda_device_state_h->num_qp_groups = num_qp_groups;
     ibgda_device_state_h->log2_cumem_granularity = t->log2_cumem_granularity;
     ibgda_device_state_h->num_shared_dcis = num_shared_dci_handles;
     ibgda_device_state_h->num_exclusive_dcis = num_dci_handles - num_shared_dci_handles;
     ibgda_device_state_h->dci_map_type = dc_map_type;
     ibgda_device_state_h->ndcts_per_pe = num_dct_handles / n_devs_selected / n_pes;
-    ibgda_device_state_h->num_dct_groups = IBGDA_MAX(
-	ibgda_device_state_h->num_exclusive_dcis / (num_dct_handles / n_devs_selected), 1);
+    if (num_dct_handles)
+	ibgda_device_state_h->num_dct_groups =
+	     IBGDA_MAX(ibgda_device_state_h->num_exclusive_dcis / (num_dct_handles / n_devs_selected), 1);
     ibgda_device_state_h->num_rc_per_pe = num_rc_handles / n_devs_selected / n_pes;
     ibgda_device_state_h->rc_map_type = rc_map_type;
     ibgda_device_state_h->num_requests_in_batch = ibgda_num_requests_in_batch;
@@ -1588,7 +2551,7 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
     int mype = t->my_pe;
     int n_pes = t->n_pes;
     int num_dct_eps = options->IBGDA_NUM_DCT;
-    int num_dci_eps = options->IBGDA_NUM_DCI;
+    int num_dci_dummy_eps = options->IBGDA_NUM_DCI;
     int num_shared_dci_eps = options->IBGDA_NUM_SHARED_DCI;
     int num_rc_eps_per_pe = options->IBGDA_NUM_RC_PER_PE;
     int num_rc_eps = num_rc_eps_per_pe * n_pes;
@@ -1672,18 +2635,23 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
 			   "NVSHMEM_IBGDA_NUM_FETCH_SLOTS_PER_DCI must be at least %d.\n",
 			   warp_size);
     }
-
-    if (num_dci_eps <= 0) {
+/* We do not support DCI. Below code removal help to provide
+ * support export NVSHMEM_IBGDA_NUM_DCI=0
+ * Default handling is NVSHMEM_IBGDA_NUM_DCI=0
+ * is not supported in IBGDA.
+ */
+#if 0
+    if (num_dci_dummy_eps <= 0) {
 	switch (dc_map_type) {
 	    case NVSHMEMI_IBGDA_DEVICE_QP_MAP_TYPE_CTA:
 	    case NVSHMEMI_IBGDA_DEVICE_QP_MAP_TYPE_SM:
-		num_dci_eps = mpc;
+		num_dci_dummy_eps = mpc;
 		break;
 	    case NVSHMEMI_IBGDA_DEVICE_QP_MAP_TYPE_WARP:
-		num_dci_eps = mpc * warp_size;
+		num_dci_dummy_eps = mpc * warp_size;
 		break;
 	    case NVSHMEMI_IBGDA_DEVICE_QP_MAP_TYPE_DCT:
-		num_dci_eps = num_dct_eps * n_pes;
+		num_dci_dummy_eps = num_dct_eps * n_pes;
 		break;
 	    default:
 		NVSHMEMI_ERROR_JMP(status, NVSHMEMX_ERROR_INVALID_VALUE, out,
@@ -1691,9 +2659,10 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
 				   ibgda_state->options->IBGDA_DCI_MAP_BY);
 		break;
 	}
-	num_dci_eps = num_dci_eps + num_shared_dci_eps;
+	num_dci_dummy_eps = num_dci_dummy_eps + num_shared_dci_eps;
     }
-    assert(num_dci_eps > 0);
+    assert(num_dci_dummy_eps > 0);
+#endif
     if (num_rc_eps_per_pe < 0) {
 	NVSHMEMI_ERROR_JMP(status, NVSHMEMX_ERROR_INVALID_VALUE, out,
 			   "NVSHMEM_IBGDA_NUM_RC_PER_PE must be positive or zero.\n");
@@ -1723,7 +2692,7 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
 	NVSHMEMI_WARN_PRINT("NVSHMEM_IBGDA_NUM_DCT < 2 and may impact performance.");
     }
 
-    if (num_shared_dci_eps > num_dci_eps) {
+    if (num_shared_dci_eps > num_dci_dummy_eps) {
 	NVSHMEMI_ERROR_JMP(status, NVSHMEMX_ERROR_INVALID_VALUE, out,
 			   "IBGDA_NUM_SHARED_DCI > IBGDA_NUM_DCI.");
     }
@@ -1747,7 +2716,7 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
 	device->dci.map_by = dc_map_type;
 	device->rc.map_by = rc_map_type;
 	device->dct.num_eps = num_dct_eps;
-	device->dci.num_eps = num_dci_eps;
+	device->dci.num_eps = num_dci_dummy_eps;
 	device->dci.num_shared_eps = num_shared_dci_eps;
 	device->rc.num_eps_per_pe = num_rc_eps_per_pe;
 	/* set device info end */
@@ -1822,17 +2791,25 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
 
 	// Transition DCI to RTS.
 	for (int i = 0; i < device->dci.num_eps; ++i) {
-	    status = ibgda_qp_rst2init(device->dci.eps[i], device, portid);
-	    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-				  "ibgda_qp_rst2init failed on DCI #%d.", i);
+	    const struct ibv_port_attr *port_attr = device->port_attr + (portid - 1);
+	    struct ibv_qp* ib_qp = device->dci.eps[i]->devx_qp;
+	    struct ibv_qp_attr ib_qp_attr;
+	    struct ib_uverbs_qp_attr ib_qp_uattr;
 
-	    status = ibgda_dci_init2rtr(ibgda_state, device->dci.eps[i], device, portid);
-	    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-				  "ibgda_dci_init2rtr failed on DCI #%d.", i);
+	    memcpy(&ib_qp_attr.ah_attr, &device->dct.ah_attr, sizeof(ib_qp_attr.ah_attr));
+	    // RST2INIT
+	    memset(&ib_qp_attr, 0, sizeof(ib_qp_attr));
+	    ib_qp_uattr.qp_state = IBV_QPS_INIT;
+	    ib_qp_uattr.pkey_index = 0;
+	    ib_qp_uattr.port_num = portid;
+	    ib_qp_uattr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
+					  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
+	    ib_qp_uattr.qp_attr_mask = (IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+					IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
 
-	    status = ibgda_qp_rtr2rts(device->dci.eps[i], device, portid);
+	    status = bnxt_re_dv_modify_qp(ib_qp, &ib_qp_uattr, 0, 0);
 	    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-				  "ibgda_qp_rtr2rts failed on DCI #%d.", i);
+				  "bnxt_re_dv_modify_qp rst2init for dci failed.\n");
 	}
 	/* create and assign DCIs end */
 
@@ -1843,6 +2820,7 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
 	    if (i / device->rc.num_eps_per_pe == mype) {
 		continue;
 	    }
+
 	    status = ibgda_create_qp(&device->rc.eps[i], device, portid, i,
 				     NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC);
 	    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
@@ -1859,6 +2837,7 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
 		sizeof(*local_rc_handles) * device->rc.num_eps_per_pe, t->boot_handle);
 	    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "alltoall of rc failed.");
 	}
+	INFO(0, "IBGDA_BNXT from %s %d num_rc_eps %d", __func__, __LINE__, num_rc_eps);
 
 	for (int i = 0; i < num_rc_eps; ++i) {
 	    // No loopback to self
@@ -1903,6 +2882,7 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
 	device->support_half_av_seg = support_half_av_seg;
 	device->may_skip_cst = skip_cst;
     }
+	INFO(5, "IBGDA_BNXT from %s %d num_rc_eps %d", __func__, __LINE__, num_rc_eps);
     /* set all device support_half_av_seg and need_cst together end */
 
 out:
@@ -1941,6 +2921,7 @@ out_already_connected:
 int nvshmemt_ibgda_release_mem_handle(nvshmem_mem_handle_t *mem_handle, nvshmem_transport_t t) {
     int status = 0;
     nvshmemt_ibgda_state_t *ibgda_state = (nvshmemt_ibgda_state_t *)t->state;
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: from %s %d \n", __func__, __LINE__);
 
     nvshmemi_ibgda_device_state_t *ibgda_device_state =
 	(nvshmemi_ibgda_device_state_t *)t->type_specific_shared_state;
@@ -2140,6 +3121,7 @@ int nvshmemt_ibgda_add_device_remote_mem_handles(nvshmem_transport_t t, int tran
     nvshmemt_ibgda_state_t *ibgda_state = (nvshmemt_ibgda_state_t *)t->state;
     int status = 0;
     int n_pes = t->n_pes;
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: from %s %d \n", __func__, __LINE__);
 
     size_t num_rkeys;
 
@@ -2219,6 +3201,7 @@ out:
 	if (ibgda_device_rkeys_d) cudaFree(ibgda_device_rkeys_d);
 	ibgda_device_rkeys.clear();
     }
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: from %s %d \n", __func__, __LINE__);
     return status;
 }
 
@@ -2563,14 +3546,15 @@ int nvshmemt_init(nvshmem_transport_t *t, struct nvshmemi_cuda_fn_table *table, 
 	if (!strstr(name, "bnxt_re")) {
 	    ftable.close_device(device->context);
 	    device->context = NULL;
-	    NVSHMEMI_WARN_PRINT("device %s is not enumerated as an bnxt_re device. Skipping...\n",
-				name);
+	    NVSHMEMI_WARN_PRINT("device %s log_level %d is not enumerated as an bnxt_re device. Skipping...\n",
+				name, ibgda_state->log_level);
 	    continue;
 	}
 
 	status = ftable.query_device(device->context, &device->device_attr);
 	NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "ibv_query_device failed \n");
 
+	//if (!nvshmemt_ib_common_query_bnxt_re_caps(device->context)) {
 	if (0) {
 	    ftable.close_device(device->context);
 	    device->context = NULL;
