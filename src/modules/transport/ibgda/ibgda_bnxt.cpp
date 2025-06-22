@@ -1948,7 +1948,9 @@ static int ibgda_create_dct_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
     NVSHMEMI_NULL_ERROR_JMP(pd, status, NVSHMEMX_ERROR_INTERNAL, out,
 			    "ibv_alloc_parent_domain failed.\n");
 #endif
-    pd = device->pd;
+    pd = ftable.alloc_pd(device->context);
+    NVSHMEMI_NULL_ERROR_JMP(pd, status, NVSHMEMX_ERROR_INTERNAL, out,
+					    "ibv_alloc_pd failed \n");
 
     srq_init_attr.attr.max_wr = ibgda_srq_depth;
     srq_init_attr.attr.max_sge = 1;
