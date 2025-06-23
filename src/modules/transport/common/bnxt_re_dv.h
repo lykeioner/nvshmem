@@ -104,18 +104,22 @@ enum bnxt_re_dv_obj_type {
 
 int bnxt_re_dv_modify_qp_udp_sport(struct ibv_qp *qp, uint16_t udp_sport);
 
-struct bnxt_re_dv_dbr_attr {
-	uint32_t dpi_idx;
+struct bnxt_re_dv_db_region_attr {
+	uint32_t dbr_handle;
+	uint32_t dpi;
 	uint64_t umdbr;
-	void *dbr;
+	__u64 *dbr;
 };
 
 #ifdef EXPERIMENTAL_APIS
-int bnxt_re_dv_alloc_dbr(struct ibv_context *ctx, struct bnxt_re_dv_dbr_attr *out);
-int bnxt_re_dv_free_dbr(struct ibv_context *ctx, uint32_t dpi_idx);
+struct bnxt_re_dv_db_region_attr *
+bnxt_re_dv_alloc_db_region(struct ibv_context *ctx);
+int bnxt_re_dv_free_db_region(struct ibv_context *ctx,
+			      struct bnxt_re_dv_db_region_attr *attr);
 #endif
 
-int bnxt_re_dv_get_default_dbr(struct ibv_context *ibvctx, struct bnxt_re_dv_dbr_attr *out);
+int bnxt_re_dv_get_default_db_region(struct ibv_context *ibvctx,
+				     struct bnxt_re_dv_db_region_attr *out);
 
 enum  bnxt_re_dv_umem_in_flags {
 	BNXT_RE_DV_UMEM_FLAGS_DMABUF = 1 << 0,
@@ -151,6 +155,7 @@ struct bnxt_re_dv_qp_init_attr {
 
 	/* DV params */
 	uint64_t qp_handle;	/* to match with cqe */
+	uint32_t dbr_handle;	/* dbr_handle from alloc_dbr */
 	void *sq_umem_handle;	/* umem_handle from umem_reg */
 	uint64_t sq_umem_offset;	/* offset into umem */
 	uint32_t sq_len;	/* sq length including MSN area */
@@ -196,6 +201,9 @@ int bnxt_re_dv_query_qp(void *qp_handle, struct ib_uverbs_qp_attr *attr);
 int bnxt_re_dv_qp_mem_alloc(struct ibv_pd *ibvpd,
 			    struct ibv_qp_init_attr *attr,
 			    struct bnxt_re_dv_qp_mem_info *dv_qp_mem);
+int bnxt_re_dv_qp_get_mem_info(struct ibv_pd *ibvpd,
+			       struct ibv_qp_init_attr *attr,
+			       struct bnxt_re_dv_qp_mem_info *qp_mem);
 #ifdef __cplusplus
 }
 #endif

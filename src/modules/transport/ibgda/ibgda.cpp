@@ -2486,8 +2486,9 @@ static int ibgda_setup_gpu_state(nvshmem_transport_t t) {
     if (num_rc_handles > 0) {
         rc_h = (nvshmemi_ibgda_device_qp_t *)calloc(num_rc_handles, sizeof(*rc_h));
         NVSHMEMI_NULL_ERROR_JMP(rc_h, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out, "rc calloc err.");
-        for (int i = 0; i < num_dci_handles; i++) {
-            nvshmemi_init_ibgda_device_qp(dci_h[i]);
+	for (int i = 0; i < num_rc_handles; i++) {
+	    /* TBD - Looks like bug in original code. */
+	    nvshmemi_init_ibgda_device_qp(rc_h[i]);
         }
     }
 

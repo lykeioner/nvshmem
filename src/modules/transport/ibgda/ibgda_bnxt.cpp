@@ -49,7 +49,10 @@
     } while (0)
 
 #define NVSHMEMI_IBGDA_CQE_SIZE 64
-#define NVSHMEMI_IBGDA_MAX_INLINE_SIZE (8 * 32)
+/* TBD - Hardcoding based on max sges are 13 */
+#define NVSHMEMI_IBGDA_BNXT_MAX_INLINE_SIZE (16 * 13)
+#define NVSHMEMI_IBGDA_BNXT_SEND_SGE 1
+#define NVSHMEMI_IBGDA_BNXT_RECV_SGE 1
 
 #define MAX_NUM_HCAS 16
 #define MAX_NUM_PORTS 4
@@ -158,6 +161,7 @@ struct ibgda_mem_object {
 #ifdef NVSHMEM_USE_GDRCOPY
     gdr_mh_t mh;
 #endif
+    struct bnxt_re_dv_qp_mem_info qp_mem;
 };
 
 /* TBD - Move this to DV API */
@@ -1504,15 +1508,23 @@ static int ibgda_create_qp_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
     struct bnxt_re_dv_cq dvrcq;
     struct bnxt_re_dv_srq dvsrq;
 
+    struct bnxt_re_dv_qp_init_attr dv_qp_attr = {};
+    struct bnxt_re_dv_qp_mem_info qp_mem = {};
+    struct ibv_qp_init_attr attr = {};
+
     int pdn = 0;
     int srqn = 0;
     int rcqn = 0;
+    int nslots;
+    int psn_nslots;
 
     assert(ibgda_qp_depth > 0);
     size_t num_wqebb = IBGDA_ROUND_UP_POW2_OR_0(ibgda_qp_depth);
 
     size_t wq_buf_size_per_qp;
     size_t wq_buf_size;
+    size_t rq_buf_size_per_qp;
+    size_t rq_buf_size;
     struct ibgda_mem_object *wq_mobject = NULL;
     struct ibgda_mem_object *rq_mobject = NULL;
 
@@ -1597,22 +1609,75 @@ static int ibgda_create_qp_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
 			 pdn, srqn, rcqn, __func__, __LINE__);
 
     // Allocate and map WQ buffer for all QPs.
-    wq_buf_size_per_qp = num_wqebb * BNXT_SEND_WQE_BB;  // num_wqebb is always a power of 2
+    dv_qp_attr.qp_type = IBV_QPT_RC;
+    dv_qp_attr.max_send_wr = num_wqebb;  // num_wqebb is always a power of 2
+    dv_qp_attr.max_recv_wr = 1;
+    dv_qp_attr.max_send_sge = NVSHMEMI_IBGDA_BNXT_SEND_SGE;
+    dv_qp_attr.max_recv_sge = NVSHMEMI_IBGDA_BNXT_RECV_SGE;
+    dv_qp_attr.max_inline_data = NVSHMEMI_IBGDA_BNXT_MAX_INLINE_SIZE;
+
+    /* Try max case scenario for now.
+     * IBGDA_GPAGE_SIZE is 64K so need to handle all the cases.
+     * For each wqe max possible slots are 15.
+     * Do we need to save nslots to handle psn area vs wqe area ?
+     * If yes, tx_wq is better place ?
+     * Improve TBD. */
+    nslots = num_wqebb * 15;
+    psn_nslots = IBGDA_ROUND_UP_POW2_OR_0(nslots);
+
+    /* slots size is 16 bytes. One PSN entry size is 8 bytes */
+    wq_buf_size_per_qp = (nslots * 16) + (psn_nslots * 8);
+
+    /* Alignment */
+    wq_buf_size_per_qp = (wq_buf_size_per_qp + IBGDA_GPAGE_SIZE - 1)  & ~(IBGDA_GPAGE_SIZE - 1);
+
     wq_buf_size = wq_buf_size_per_qp * num_eps;
+
     status = ibgda_nic_control_alloc(&wq_mobject, wq_buf_size, IBGDA_GPAGE_SIZE);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot allocate wq buf.\n");
 
     NVSHMEMI_WARN_PRINT("IBGDA_BNXT: QP wq_mobject from %s %d \n",
 			 __func__, __LINE__);
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: wq_buf_size (%d * %d * %d) = %d -> (0x%x * %d) = %d"
+			" slots 0x%x psn_slots 0x%x\n",
+			 num_wqebb, BNXT_SEND_WQE_BB, num_eps,
+			 (num_wqebb * BNXT_SEND_WQE_BB * num_eps),
+			 wq_buf_size_per_qp, num_eps,
+			 wq_buf_size, nslots, psn_nslots);
+
+    wq_mobject->qp_mem.qp_handle = 0;
+    wq_mobject->qp_mem.sq_len = wq_buf_size_per_qp;
+    wq_mobject->qp_mem.sq_slots = nslots;
+    wq_mobject->qp_mem.sq_wqe_sz = 0xf0; /* Max sq wqe size based on 15 sges */
+    wq_mobject->qp_mem.sq_psn_sz = 0x8;
+    wq_mobject->qp_mem.sq_npsn = psn_nslots;
+
     status = ibgda_mobject_nic_map(wq_mobject, context, IBV_ACCESS_LOCAL_WRITE,
 				   ibgda_state->dmabuf_support_for_control_buffers);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot register wq buf.\n");
 
     // Allocate and map RQ buffer for all QPs.
-    wq_buf_size_per_qp = num_wqebb * BNXT_SEND_WQE_BB;  // num_wqebb is always a power of 2
-    wq_buf_size = wq_buf_size_per_qp * num_eps;
-    status = ibgda_nic_control_alloc(&rq_mobject, wq_buf_size, IBGDA_GPAGE_SIZE);
+    rq_buf_size_per_qp = num_wqebb * BNXT_SEND_WQE_BB;  // num_wqebb is always a power of 2
+    rq_buf_size = rq_buf_size_per_qp * num_eps;
+
+    /* TBD.
+     * 2 slots for header + 1 slots per sge. */
+    nslots = (2 + NVSHMEMI_IBGDA_BNXT_SEND_SGE) * num_wqebb;
+    /* slots size is 16 bytes */
+    rq_buf_size_per_qp = (nslots * 16);
+    /* Alignment */
+    rq_buf_size_per_qp = (rq_buf_size_per_qp + IBGDA_GPAGE_SIZE - 1) & ~(IBGDA_GPAGE_SIZE - 1);
+    rq_buf_size = rq_buf_size_per_qp * num_eps;
+
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: rq_buf_size 0x%x nslots 0x%x \n",
+		    rq_buf_size_per_qp, nslots);
+
+    status = ibgda_nic_control_alloc(&rq_mobject, rq_buf_size, IBGDA_GPAGE_SIZE);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot allocate wq buf.\n");
+
+    rq_mobject->qp_mem.rq_len = rq_buf_size_per_qp;
+    rq_mobject->qp_mem.rq_slots = nslots;
+    rq_mobject->qp_mem.rq_wqe_sz = 0x30; /* size based on 1 sge */
 
     NVSHMEMI_WARN_PRINT("IBGDA_BNXT: QP rq_mobject from %s %d \n",
 			 __func__, __LINE__);
@@ -1680,20 +1745,21 @@ static int ibgda_alloc_and_map_qp_uar(struct ibv_context *context, ibgda_nic_han
     size_t uar_reg_size = 0;
     uint8_t log_bf_reg_size = 0;
 
-    struct bnxt_re_dv_dbr_attr attr = {};
-    memset(&attr, 0, sizeof(struct bnxt_re_dv_dbr_attr));
+    struct bnxt_re_dv_db_region_attr attr = {};
+    memset(&attr, 0, sizeof(struct bnxt_re_dv_db_region_attr));
 
     /* allocate host memory for dct, rc, cq, dci start */
     uar = (struct bnxt_re_dv_devx_uar *)malloc(sizeof(struct bnxt_re_dv_devx_uar));
     NVSHMEMI_NULL_ERROR_JMP(uar, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out, "bnxt_re uar err.");
 
-    if (bnxt_re_dv_get_default_dbr(context, &attr)) {
+    if (bnxt_re_dv_get_default_db_region(context, &attr)) {
 	    NVSHMEMI_WARN_PRINT(
 		"GPU1: bnxt_re_dv_get_default_dbr failed.\n");
 	    status = NVSHMEMX_ERROR_INTERNAL;
 	    goto out;
     }
     uar->reg_addr = (void*)attr.dbr;
+    uar->dpi_idx = attr.dpi;
     uar->context  = context;
 
     NVSHMEMI_WARN_PRINT("IBGDA_BNXT: dpi 0x%lx dpi_id 0x%x from %s %d \n",
@@ -1766,6 +1832,8 @@ static int ibgda_create_qp(struct ibgda_ep **ep_ptr, struct ibgda_device *device
     struct ibv_context *context = pd->context;
     struct ibgda_ep *ep = NULL;
     struct bnxt_re_dv_qp_init_attr dv_qp_attr = {};
+    struct bnxt_re_dv_qp_mem_info qp_mem = {};
+    struct ibv_qp_init_attr attr = {};
 
     void *qp_context;
 
@@ -1816,22 +1884,41 @@ static int ibgda_create_qp(struct ibgda_ep **ep_ptr, struct ibgda_device *device
 
     dv_qp_attr.qp_type = IBV_QPT_RC;
     dv_qp_attr.max_send_wr = num_wqebb;
+    // TBD - Hardcoding. DeepEP required higher recv queue size
+    dv_qp_attr.max_recv_wr = num_wqebb;
+    dv_qp_attr.max_send_sge = NVSHMEMI_IBGDA_BNXT_SEND_SGE;
+    dv_qp_attr.max_recv_sge = NVSHMEMI_IBGDA_BNXT_RECV_SGE;
     // TBD - Hardcoding
-    dv_qp_attr.max_recv_wr = 1;
-    dv_qp_attr.max_send_sge = 1;
-    dv_qp_attr.max_recv_sge = 1;
-    // TBD - Hardcoding
-    dv_qp_attr.max_inline_data = 96;
+    dv_qp_attr.max_inline_data = NVSHMEMI_IBGDA_BNXT_MAX_INLINE_SIZE;
     dv_qp_attr.sq_umem_handle = wq_umem;
     dv_qp_attr.rq_umem_handle = rq_umem;
     dv_qp_attr.send_cq = send_cq->devx_cq;
     // TBD - Use srq
     dv_qp_attr.recv_cq = device->qp_shared_object.recv_cq;
 
+    dv_qp_attr.qp_handle = device->qp_shared_object.wq_mobject->qp_mem.qp_handle;
+    dv_qp_attr.sq_len = device->qp_shared_object.wq_mobject->qp_mem.sq_len;
+    dv_qp_attr.sq_slots = device->qp_shared_object.wq_mobject->qp_mem.sq_slots;
+    dv_qp_attr.sq_wqe_sz = device->qp_shared_object.wq_mobject->qp_mem.sq_wqe_sz;
+    dv_qp_attr.sq_psn_sz = device->qp_shared_object.wq_mobject->qp_mem.sq_psn_sz;
+    dv_qp_attr.sq_npsn = device->qp_shared_object.wq_mobject->qp_mem.sq_npsn;
+    dv_qp_attr.rq_len = device->qp_shared_object.rq_mobject->qp_mem.rq_len;
+    dv_qp_attr.rq_slots = device->qp_shared_object.rq_mobject->qp_mem.rq_slots;
+    dv_qp_attr.rq_wqe_sz = device->qp_shared_object.rq_mobject->qp_mem.rq_wqe_sz;
+
+    INFO(5, "IBGDA_BNXT: from %s %d 0x%lx sq_len 0x%x sq_slots 0x%x sq_wqe_sz 0x%x"
+		   "sq_psn_sz 0x%x sq_npsn 0x%x rq_len 0x%x rq_slots 0x%x rq_wqe_sz 0x%x\n",
+		    __func__, __LINE__,
+		    dv_qp_attr.qp_handle, dv_qp_attr.sq_len,
+		    dv_qp_attr.sq_slots, dv_qp_attr.sq_wqe_sz,
+		    dv_qp_attr.sq_psn_sz, dv_qp_attr.sq_npsn,
+		    dv_qp_attr.rq_len, dv_qp_attr.rq_slots,
+		    dv_qp_attr.rq_wqe_sz);
+
     ep->devx_qp = bnxt_re_dv_create_qp(device->dct.pd, &dv_qp_attr);
 
     NVSHMEMI_NULL_ERROR_JMP(ep->devx_qp, status, NVSHMEMX_ERROR_INTERNAL, out,
-			    "GPU1 Unable to create QP for EP.\n");
+			    "Unable to create QP for EP.\n");
     ep->portid = portid;
 
     ep->sq_cnt = num_wqebb;
@@ -2034,103 +2121,11 @@ out:
     return status;
 }
 
+
 static int ibgda_create_dct(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_ep **ep_ptr,
 			    const struct ibgda_device *device, int portid) {
-    int status = 0;
-
-    struct ibgda_ep *ep = NULL;
-    struct ibv_qp *ib_qp = NULL;
-
-    struct ibv_qp_init_attr_ex ib_qp_attr_ex;
-    struct ibv_qp_init_attr init_attr;
-    struct ibv_qp_attr ib_qp_attr;
-    struct bnxt_re_dv_qp_init_attr dv_qp_attr = {};
-
-    const struct ibv_port_attr *port_attr = device->port_attr + (portid - 1);
-
-    memset(&ib_qp_attr_ex, 0, sizeof(ib_qp_attr_ex));
-
-    ep = (struct ibgda_ep *)calloc(1, sizeof(struct ibgda_ep));
-    NVSHMEMI_NULL_ERROR_JMP(ep, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
-			    "Unable to allocate mem for ep.\n");
-
-    ib_qp_attr_ex.pd = device->dct.pd;
-    ib_qp_attr_ex.comp_mask = IBV_QP_INIT_ATTR_PD;
-    /* Note - This is dummy for IBGDA_BNXT.
-     * Use NVSHMEM_IBGDA_NUM_DCT=0
-     */
-    ib_qp_attr_ex.qp_type = IBV_QPT_RC; /* IBV_QPT_DRIVER type is used in orig. */
-    ib_qp_attr_ex.srq = device->dct.srq;
-    ib_qp_attr_ex.send_cq = device->dct.send_cq;
-    ib_qp_attr_ex.recv_cq = device->dct.recv_cq;
-
-    ib_qp_attr_ex.cap.max_send_wr = ibgda_state->options->QP_DEPTH;
-    ib_qp_attr_ex.cap.max_recv_wr = ibgda_state->options->QP_DEPTH;
-    ib_qp_attr_ex.cap.max_send_sge = 1;
-    ib_qp_attr_ex.cap.max_recv_sge = 1;
-    ib_qp_attr_ex.cap.max_inline_data = NVSHMEMI_IBGDA_MAX_INLINE_SIZE;
-
-    dv_qp_attr.qp_type = ib_qp_attr_ex.qp_type;
-    dv_qp_attr.max_send_wr = ib_qp_attr_ex.cap.max_send_wr;
-    dv_qp_attr.max_recv_wr = ib_qp_attr_ex.cap.max_recv_wr;
-    dv_qp_attr.max_send_sge = ib_qp_attr_ex.cap.max_send_sge;
-    dv_qp_attr.max_recv_sge = ib_qp_attr_ex.cap.max_recv_sge;
-
-    // TBD - Hardcoding
-    ib_qp_attr_ex.cap.max_inline_data = 96;
-    dv_qp_attr.max_inline_data = ib_qp_attr_ex.cap.max_inline_data;
-    dv_qp_attr.send_cq = ib_qp_attr_ex.send_cq;
-    dv_qp_attr.recv_cq = ib_qp_attr_ex.recv_cq;
-
-    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: context %lx %lx from %s %d \n",
-			 device->context, device->dct.pd->context, __func__, __LINE__);
-    ib_qp = bnxt_re_dv_create_qp(device->dct.pd, &dv_qp_attr);
-
-    NVSHMEMI_NULL_ERROR_JMP(ib_qp, status, NVSHMEMX_ERROR_INTERNAL, out,
-			    "bnxt_re_dv_create_qp failed.\n");
-
-    // RST2INIT
-    memset(&ib_qp_attr, 0, sizeof(ib_qp_attr));
-    ib_qp_attr.qp_state = IBV_QPS_INIT;
-    ib_qp_attr.pkey_index = 0;
-    ib_qp_attr.port_num = portid;
-    ib_qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
-				 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
-
-    status = ftable.modify_qp(ib_qp, &ib_qp_attr,
-			      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "ibv_modify_qp rst2init for dct failed.\n");
-
-    // INIT2RTR
-    memset(&ib_qp_attr, 0, sizeof(ib_qp_attr));
-    ib_qp_attr.qp_state = IBV_QPS_RTR;
-    ib_qp_attr.path_mtu = port_attr->active_mtu;
-    ib_qp_attr.min_rnr_timer = 12;
-    memcpy(&ib_qp_attr.ah_attr, &device->dct.ah_attr, sizeof(ib_qp_attr.ah_attr));
-
-    status = ftable.modify_qp(ib_qp, &ib_qp_attr,
-			      IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_MIN_RNR_TIMER);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-			  "ibv_modify_qp init2rtr for dct failed.\n");
-
-    ep->qp_type = NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCT;
-
-    ep->ib_qp = ib_qp;
-    ep->qpn = ib_qp->qp_num;
-    ep->portid = portid;
-
-    *ep_ptr = ep;
-
-out:
-    if (status) {
-	if (ib_qp) {
-	    int _status = ftable.destroy_qp(ib_qp);
-	    if (_status) NVSHMEMI_ERROR_PRINT("ibv_destroy_qp for dct failed.\n");
-	}
-	if (ep) free(ep);
-    }
-    return status;
+    NVSHMEMI_ERROR_PRINT("ibgda_create_dct not supported");
+    return NVSHMEMX_ERROR_NOT_SUPPORTED;
 }
 
 static int ibgda_get_dct_handle(struct ibgda_dct_handle *dct_handle, const struct ibgda_ep *ep,
@@ -2324,8 +2319,11 @@ static int ibgda_setup_gpu_state(nvshmem_transport_t t) {
     if (num_rc_handles > 0) {
 	rc_h = (nvshmemi_ibgda_device_qp_t *)calloc(num_rc_handles, sizeof(*rc_h));
 	NVSHMEMI_NULL_ERROR_JMP(rc_h, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out, "rc calloc err.");
-	for (int i = 0; i < num_dci_handles; i++) {
-	    nvshmemi_init_ibgda_device_qp(dci_h[i]);
+	/* TBD - Looks like original code used incorrect array.
+	 * Review and fix it later.
+	 */
+	for (int i = 0; i < num_rc_handles; i++) {
+	    nvshmemi_init_ibgda_device_qp(rc_h[i]);
 	}
     }
 
@@ -2796,9 +2794,9 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
 	/* Gather DCT handles end */
 
 	/* create and assign DCIs start */
-	INFO(ibgda_state->log_level, "Creating %d DCI QPs (shared: %d, exclusive: %d)",
+	INFO(ibgda_state->log_level, "Creating %d DCI QPs (shared: %d, exclusive: %d) loglevel %d",
 	     device->dci.num_eps, device->dci.num_shared_eps,
-	     device->dci.num_eps - device->dci.num_shared_eps);
+	     device->dci.num_eps - device->dci.num_shared_eps, ibgda_state->log_level);
 
 	for (int i = 0; i < device->dci.num_eps; ++i) {
 	    status = ibgda_create_qp(&device->dci.eps[i], device, portid, i,
