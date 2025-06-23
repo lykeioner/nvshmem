@@ -60,6 +60,7 @@ int nvshmemi_transport_init(nvshmemi_state_t *state) {
     char transport_object_file[transport_object_file_len];
     bool transport_selected = false;
     nvshmem_local_buf_cache_t *tmp_cache_ptr = NULL;
+    int ibgda_load = 0;
 
     if (!state->transports)
         state->transports =
@@ -224,25 +225,42 @@ transport_init:
 transport_fail:
 #ifdef NVSHMEM_IBGDA_SUPPORT
     if (nvshmemi_options.IB_ENABLE_IBGDA) {
-	status = snprintf(transport_object_file, transport_object_file_len,
-			  "nvshmem_transport_ibgda.so.%d", NVSHMEM_TRANSPORT_PLUGIN_MAJOR_VERSION);
-	if (status < 0 || status > transport_object_file_len) {
-	    WARN("Unable to open the %s transport. %s\n", transport_object_file, dlerror());
-	    goto out;
+try_another:
+	if (ibgda_load == 0) {
+	    status = snprintf(transport_object_file, transport_object_file_len,
+		  "nvshmem_transport_ibgda_bnxt.so.%d", NVSHMEM_TRANSPORT_PLUGIN_MAJOR_VERSION);
+	    if (status < 0 || status > transport_object_file_len) {
+		WARN("Unable to open the %s transport. %s\n", transport_object_file, dlerror());
+		goto out;
+	    }
+	    INFO(NVSHMEM_INIT, "Using BNXT IBGDA from %s", __func__);
 	}
+
+	if (ibgda_load == 1) {
+	    status = snprintf(transport_object_file, transport_object_file_len,
+		  "nvshmem_transport_ibgda.so.%d", NVSHMEM_TRANSPORT_PLUGIN_MAJOR_VERSION);
+	    if (status < 0 || status > transport_object_file_len) {
+		WARN("Unable to open the %s transport. %s\n", transport_object_file, dlerror());
+		goto out;
+	    }
+
+	    INFO(NVSHMEM_INIT, "Using MLX IBGDA from %s", __func__);
+	}
+
+	ibgda_load++;
+
 	transport_lib_IBGDA = dlopen(transport_object_file, RTLD_NOW);
 	if (transport_lib_IBGDA == NULL) {
 	    WARN("Unable to open the %s transport. %s\n", transport_object_file, dlerror());
 	    goto out;
 	}
 
-        init_fn = (nvshmemi_transport_init_fn)dlsym(transport_lib_IBGDA, "nvshmemt_init");
-        if (!init_fn) {
-            dlclose(transport_lib_IBGDA);
-            transport_lib_IBGDA = NULL;
-            WARN("Unable to get info from %s transport.\n", transport_object_file);
-            goto out;
-        }
+	init_fn = (nvshmemi_transport_init_fn)dlsym(transport_lib_IBGDA, "nvshmemt_init");
+	if (!init_fn) {
+	    dlclose(transport_lib_IBGDA);
+	    transport_lib_IBGDA = NULL;
+	    goto out;
+	}
 
         status = nvshmemi_local_mem_cache_init(&tmp_cache_ptr);
         NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMI_INTERNAL_ERROR, out,
@@ -276,6 +294,10 @@ transport_fail:
             nvshmemi_local_mem_cache_fini(tmp_cache_ptr);
             dlclose(transport_lib_IBGDA);
             transport_lib_IBGDA = NULL;
+
+	    if (ibgda_load == 1)
+		    goto try_another;
+
             status = 0;
         }
     } else {
