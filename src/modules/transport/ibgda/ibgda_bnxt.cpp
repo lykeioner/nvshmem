@@ -1915,7 +1915,7 @@ static int ibgda_create_qp(struct ibgda_ep **ep_ptr, struct ibgda_device *device
 		    dv_qp_attr.rq_len, dv_qp_attr.rq_slots,
 		    dv_qp_attr.rq_wqe_sz);
 
-    ep->devx_qp = bnxt_re_dv_create_qp(device->dct.pd, &dv_qp_attr);
+    ep->devx_qp = bnxt_re_dv_create_qp(pd, &dv_qp_attr);
 
     NVSHMEMI_NULL_ERROR_JMP(ep->devx_qp, status, NVSHMEMX_ERROR_INTERNAL, out,
 			    "Unable to create QP for EP.\n");
