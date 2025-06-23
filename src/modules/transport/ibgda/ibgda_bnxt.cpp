@@ -639,8 +639,8 @@ static int ibgda_mobject_nic_map(struct ibgda_mem_object *mobject, struct ibv_co
     assert(!mobject->has_nic_mapping);
     assert(context);
 
-    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: use_dmabuf %d from %s %d \n",
-			 use_dmabuf, __func__, __LINE__);
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: use_dmabuf %d from %s %d object size %d\n",
+			 use_dmabuf, __func__, __LINE__, mobject->aligned.size);
 
     if (mobject->mem_type == IBGDA_MEM_TYPE_GPU) {
 	addr = (void *)mobject->aligned.gpu_ptr;
@@ -1427,6 +1427,8 @@ static int ibgda_create_cq_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
     unsigned int num_cqs = device->dci.num_eps + device->rc.num_eps_per_pe * n_pes;
 
     assert(ibgda_qp_depth > 0);
+    /* BNXT specific check */
+    assert(num_cqs > 0);
     size_t num_cqe = IBGDA_ROUND_UP_POW2_OR_0(ibgda_qp_depth);
     size_t cq_buf_size_per_cq = num_cqe * NVSHMEMI_IBGDA_CQE_SIZE;
     size_t cq_buf_size = num_cqs * cq_buf_size_per_cq;
@@ -1444,6 +1446,8 @@ static int ibgda_create_cq_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
     NVSHMEMI_NE_ERROR_JMP(status, cudaSuccess, NVSHMEMX_ERROR_INTERNAL, out,
 			  "cudaMemset failed.\n");
 
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: cq_mobject from %s %d \n",
+			 __func__, __LINE__);
     status = ibgda_mobject_nic_map(cq_mobject, context, IBV_ACCESS_LOCAL_WRITE,
 				   ibgda_state->dmabuf_support_for_control_buffers);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot register cq buf.\n");
@@ -1452,6 +1456,8 @@ static int ibgda_create_cq_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
     status = ibgda_nic_control_alloc(&dbr_mobject, dbr_buf_size, IBGDA_GPAGE_SIZE);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot allocate dbr buf.\n");
 
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: CQ dbr_mobject from %s %d \n",
+			 __func__, __LINE__);
     status = ibgda_mobject_nic_map(dbr_mobject, context, IBV_ACCESS_LOCAL_WRITE,
 				   ibgda_state->dmabuf_support_for_control_buffers);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot register dbr buf.\n");
@@ -1596,6 +1602,8 @@ static int ibgda_create_qp_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
     status = ibgda_nic_control_alloc(&wq_mobject, wq_buf_size, IBGDA_GPAGE_SIZE);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot allocate wq buf.\n");
 
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: QP wq_mobject from %s %d \n",
+			 __func__, __LINE__);
     status = ibgda_mobject_nic_map(wq_mobject, context, IBV_ACCESS_LOCAL_WRITE,
 				   ibgda_state->dmabuf_support_for_control_buffers);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot register wq buf.\n");
@@ -1606,6 +1614,8 @@ static int ibgda_create_qp_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
     status = ibgda_nic_control_alloc(&rq_mobject, wq_buf_size, IBGDA_GPAGE_SIZE);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot allocate wq buf.\n");
 
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: QP rq_mobject from %s %d \n",
+			 __func__, __LINE__);
     status = ibgda_mobject_nic_map(rq_mobject, context, IBV_ACCESS_LOCAL_WRITE,
 				   ibgda_state->dmabuf_support_for_control_buffers);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot register wq buf.\n");
@@ -1618,6 +1628,8 @@ static int ibgda_create_qp_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
 	status = ibgda_host_mem_alloc(&dbr_mobject, dbr_buf_size, IBGDA_GPAGE_SIZE, true);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot allocate dbr buf.\n");
 
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: QP dbr_mobject from %s %d \n",
+			 __func__, __LINE__);
     status = ibgda_mobject_nic_map(dbr_mobject, context, IBV_ACCESS_LOCAL_WRITE,
 				   ibgda_state->dmabuf_support_for_control_buffers);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot register dbr buf.\n");
@@ -2552,7 +2564,11 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
     /* Constants for resource creation start */
     int mype = t->my_pe;
     int n_pes = t->n_pes;
-    int num_dct_eps = options->IBGDA_NUM_DCT;
+    /* TBD -Remove dct related code. We do not support DCT.
+     * Hardcoding simulate behavior of below settings.
+     * export NVSHMEM_IBGDA_NUM_DCT=0
+     */
+    int num_dct_eps = 0;
     int num_dci_dummy_eps = options->IBGDA_NUM_DCI;
     int num_shared_dci_eps = options->IBGDA_NUM_SHARED_DCI;
     int num_rc_eps_per_pe = options->IBGDA_NUM_RC_PER_PE;
@@ -3285,6 +3301,9 @@ static int ibgda_check_nic_mapping_memtypes(nvshmemt_ibgda_state_t *ibgda_state,
 
     device->support_nic_buf_on_gpumem = can_use_gpumem;
     device->support_nic_buf_on_hostmem = can_use_hostmem;
+    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: Testing umem mobject from %s %d "
+			"can_use_gpumem %d can_use_hostmem %d\n",
+			__func__, __LINE__, can_use_gpumem, can_use_hostmem);
 
     if (!can_use_gpumem && !can_use_hostmem) return NVSHMEMX_ERROR_NOT_SUPPORTED;
 
