@@ -26,6 +26,9 @@ int nvshmemt_ib_common_nv_peer_mem_available() {
     if (access("/sys/kernel/mm/memory_peers/nvidia-peermem/version", F_OK) == 0) {
         return NVSHMEMX_SUCCESS;
     }
+    if (access("/sys/module/nvidia_peermem/version", F_OK) == 0) {
+        return NVSHMEMX_SUCCESS;
+    }
 
     return NVSHMEMX_ERROR_INTERNAL;
 }

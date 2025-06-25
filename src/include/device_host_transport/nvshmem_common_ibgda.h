@@ -181,7 +181,7 @@ typedef struct {
     char padding[NVSHMEMI_IBGDA_QP_MANAGEMENT_PADDING];
 } __attribute__((__aligned__(8))) nvshmemi_ibgda_device_qp_management_v1;
 static_assert(sizeof(nvshmemi_ibgda_device_qp_management_v1) == 112,
-              "ibgda_device_qp_management_v1 must be 104 bytes.");
+              "ibgda_device_qp_management_v1 must be 112 bytes.");
 
 typedef nvshmemi_ibgda_device_qp_management_v1 nvshmemi_ibgda_device_qp_management_t;
 
