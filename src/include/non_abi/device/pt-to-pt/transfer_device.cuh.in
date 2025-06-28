@@ -220,7 +220,12 @@ NVSHMEMI_TRANSFER_STATIC __device__ NVSHMEMI_TRANSFER_INLINE void nvshmemi_trans
     void *rptr, T value, int pe, nvshmemi_amo_t op) {
 #ifdef NVSHMEM_IBGDA_SUPPORT
     if (nvshmemi_device_state_d.ibgda_is_initialized) {
+#ifdef NVSHMEM_USE_AMO_OPS
         nvshmemi_ibgda_amo_nonfetch<T>(rptr, value, pe, op);
+#else
+        // Use RMA or use proxy?
+        nvshmemi_ibgda_rma_p<T>(rptr, value, pe);
+#endif
     } else
 #endif
     {
