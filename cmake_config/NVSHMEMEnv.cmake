@@ -80,6 +80,7 @@ nvshmem_add_default_off_option(NVSHMEM_DEVEL "Toggles NVSHMEM devel compilation 
 nvshmem_add_default_off_option(NVSHMEM_TRACE "Enable NVSHMEM trace print events")
 nvshmem_add_default_off_option(NVSHMEM_VERBOSE "Enable the ptxas verbose compilation option")
 nvshmem_add_default_off_option(NVSHMEM_ENV_ALL "Display all runtime environment variables, regardless of build settings")
+nvshmem_add_default_off_option(NVSHMEM_USE_AMO_OPS "Toggles NVSHMEM to use amo operations")
 message( "___________________________________________________________________________________________________\n\n")
 
 
