@@ -2939,6 +2939,7 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
         NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "create DCT share err.");
         /* create shared device objects end */
 
+        INFO(ibgda_state->log_level, "Creating %d DCT QPs", device->dct.num_eps);
         /* create DCTs start */
         for (int i = 0; i < device->dct.num_eps; ++i) {
             status = ibgda_create_dct(ibgda_state, &device->dct.eps[i], device, portid);
