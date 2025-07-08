@@ -13,7 +13,6 @@
 #else
 #include <cuda/std/climits>
 #endif
-#include "infiniband/mlx5dv.h"
 
 #include "non_abi/device/threadgroup/nvshmemi_common_device_defines.cuh"
 #include "device_host_transport/nvshmem_common_ibgda.h"
@@ -59,7 +58,8 @@
  */
 #define IBGDA_MAX_THREADS_PER_QUIET 32
 
-// MLX5 accepts up to 2 GiB per command
+// BNXT accepts up to 2 GiB per command
+// TBD - Double check
 #define IBGDA_MAX_TRANSFER_SIZE 2147483648LLU
 
 #ifndef likely
@@ -86,44 +86,9 @@
 #define WRITE_ONCE(x, v) (ACCESS_ONCE(x) = (v))
 #endif
 
-#ifdef NVSHMEM_IBGDA_DEBUG
-struct mlx5_err_cqe_ex {
-    uint8_t rsvd0[32];
-    __be32 srqn;
-    uint8_t rsvd1[16];
-    uint8_t hw_err_synd;
-    uint8_t hw_synd_type;
-    uint8_t vendor_err_synd;
-    uint8_t syndrome;
-    __be32 s_wqe_opcode_qpn;
-    __be16 wqe_counter;
-    uint8_t signature;
-    uint8_t op_own;
-};
-typedef struct mlx5_err_cqe_ex ibgda_mlx5_err_cqe_t;
-#else
-typedef struct mlx5_err_cqe ibgda_mlx5_err_cqe_t;
-#endif
-
 #define IBGDA_4_BYTE_EXT_AMO_OPMOD 0x08000000
 #define IBGDA_8_BYTE_EXT_AMO_OPMOD 0x09000000
 
-typedef enum ibgda_mlx5_fm {
-    IBGDA_MLX5_FM_NO_FENCE = 0,
-    IBGDA_MLX5_FM_INITIATOR_SMALL_FENCE = 1 << 5,
-    IBGDA_MLX5_FM_FENCE = 2 << 5,
-    IBGDA_MLX5_FM_STRONG_ORDERING = 3 << 5,
-    IBGDA_MLX5_FM_FENCE_AND_INITIATOR_SMALL_FENCE = 4 << 5,
-    OBGDA_MLX5_FM_OP_MAX = INT_MAX,
-} ibgda_mlx5_fm_t;
-
-enum {
-    IBGDA_MLX5_OPCODE_DUMP = 0x23,
-    IBGDA_MLX5_OPCODE_SENTINEL = INT_MAX
-
-};
-
-typedef struct mlx5_wqe_ctrl_seg __attribute__((__aligned__(8))) ibgda_ctrl_seg_t;
 typedef struct bnxt_re_bsqe __attribute__((__aligned__(8))) ibgda_bnxt_ctrl_seg_t;
 
 // The ext flag (in dqp_dct) must be set to disable.
@@ -426,7 +391,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void *ibgda_get_wqe_ptr
     nvshmemi_ibgda_device_qp_t *qp, uint16_t wqe_idx) {
     uint16_t cnt = qp->tx_wq.nwqes;
     uint16_t idx = wqe_idx & (cnt - 1);
-    return (void *)((uintptr_t)qp->tx_wq.wqe + (idx << MLX5_SEND_WQE_SHIFT));
+    return (void *)((uintptr_t)qp->tx_wq.wqe + (idx << BNXT_RE_STATIC_WQE_SHIFT));
 }
 
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
@@ -578,57 +543,13 @@ check_opcode:
 
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_nop_wqe(
     nvshmemi_ibgda_device_qp_t *qp, uint16_t wqe_idx, void **out_wqes) {
-    ibgda_ctrl_seg_t ctrl_seg;
-
-    ibgda_ctrl_seg_t *ctrl_seg_ptr = (ibgda_ctrl_seg_t *)out_wqes[0];
-
-    ctrl_seg = {
-        0,
-    };
-    ctrl_seg.qpn_ds = HTOBE32((qp->qpn << 8) | 2);
-    ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-    ctrl_seg.opmod_idx_opcode = HTOBE32((wqe_idx << 8) | MLX5_OPCODE_NOP);
-
-    // wqe_ptr will not be consumed by GPU.
-    // WRITE_ONCE ensures that compiler will not removed this code.
-    uint32_t *dst = (uint32_t *)ctrl_seg_ptr;
-    uint32_t *src = (uint32_t *)&ctrl_seg;
-    for (int i = 0; i < sizeof(*ctrl_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
+    return;
 }
 
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_dump_wqe(
     nvshmemi_ibgda_device_qp_t *qp, uint64_t laddr, __be32 lkey, uint32_t bytes, uint16_t wqe_idx,
-    ibgda_mlx5_fm_t fm, void **out_wqes) {
-    ibgda_ctrl_seg_t ctrl_seg;
-    struct mlx5_wqe_data_seg data_seg;
-
-    ibgda_ctrl_seg_t *ctrl_seg_ptr = (ibgda_ctrl_seg_t *)out_wqes[0];
-    struct mlx5_wqe_data_seg *data_seg_ptr =
-        (struct mlx5_wqe_data_seg *)((uintptr_t)out_wqes[0] + sizeof(*ctrl_seg_ptr));
-
-    data_seg.byte_count = HTOBE32(bytes);
-    data_seg.lkey = lkey;
-    data_seg.addr = HTOBE64(laddr);
-
-    ctrl_seg = {
-        0,
-    };
-    ctrl_seg.qpn_ds = HTOBE32((qp->qpn << 8) | 2);
-    ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE | fm;
-    ctrl_seg.opmod_idx_opcode = HTOBE32((wqe_idx << 8) | IBGDA_MLX5_OPCODE_DUMP);
-
-    // wqe_ptr will not be consumed by GPU.
-    // WRITE_ONCE ensures that compiler will not removed this code.
-    uint32_t *dst = (uint32_t *)ctrl_seg_ptr;
-    uint32_t *src = (uint32_t *)&ctrl_seg;
-    for (int i = 0; i < sizeof(*ctrl_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    dst = (uint32_t *)data_seg_ptr;
-    src = (uint32_t *)&data_seg;
-    for (int i = 0; i < sizeof(*data_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
+    int fm, void **out_wqes) {
+    assert(0);
 }
 
 // These MSN table routines need to change to cp the entire 64b into the GPU memory instead
@@ -957,126 +878,7 @@ ibgda_write_rdma_write_inl_wqe_combine_warp(nvshmemi_ibgda_device_qp_t *qp,
                                             nvshmemi_ibgda_device_dct_t *dct, const T val,
                                             uint64_t _raddr, __be32 rkey, uint16_t wqe_idx,
                                             int my_tid, void **out_wqes) {
-    ibgda_ctrl_seg_t ctrl_seg;
-    struct mlx5_wqe_raddr_seg raddr_seg;
-    struct mlx5_wqe_inl_data_seg inl_seg;
-
-    ibgda_ctrl_seg_t *ctrl_seg_ptr = (ibgda_ctrl_seg_t *)out_wqes[0];
-    void *av_seg_ptr = (void *)((uintptr_t)ctrl_seg_ptr + sizeof(*ctrl_seg_ptr));
-    struct mlx5_wqe_raddr_seg *raddr_seg_ptr;
-    struct mlx5_wqe_inl_data_seg *inl_seg_ptr;
-
-    size_t av_seg_size;
-    int ds;
-
-    uint32_t bytes = sizeof(T);
-    uint64_t raddr = _raddr - (my_tid * bytes);
-
-    int remaining_size_for_data_in_first_wqebb;
-    uint32_t nop_relative_wqe_idx;
-
-    if (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) {
-        ds = ibgda_get_ds_in_inl_combine_warp<T, NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI>();
-        av_seg_size = sizeof(ibgda_half_av_seg_t);
-        remaining_size_for_data_in_first_wqebb = 12;
-        nop_relative_wqe_idx =
-            ibgda_get_num_wqes_in_inl_combine_warp<T, NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI>() - 1;
-    } else {
-        ds = ibgda_get_ds_in_inl_combine_warp<T, NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC>();
-        av_seg_size = 0;
-        remaining_size_for_data_in_first_wqebb = 28;
-        nop_relative_wqe_idx =
-            ibgda_get_num_wqes_in_inl_combine_warp<T, NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC>() - 1;
-    }
-
-    raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)((uintptr_t)av_seg_ptr + av_seg_size);
-    inl_seg_ptr =
-        (struct mlx5_wqe_inl_data_seg *)((uintptr_t)raddr_seg_ptr + sizeof(*raddr_seg_ptr));
-
-    raddr_seg.raddr = HTOBE64(raddr);
-    raddr_seg.rkey = rkey;
-    raddr_seg.reserved = 0;
-
-    inl_seg.byte_count = HTOBE32((bytes * warpSize) | MLX5_INLINE_SEG);
-
-    ctrl_seg = {
-        0,
-    };
-    ctrl_seg.qpn_ds = HTOBE32((qp->qpn << 8) | ds);
-    // ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-    // This RDMA WRITE wqe will not get CQ update to avoid dynamic size calculation in poll_cq.
-    // Instead, the NO-OP wqe (last one) will get CQ update because it is always 1 WQEBB.
-    ctrl_seg.fm_ce_se = 0;
-    ctrl_seg.opmod_idx_opcode = HTOBE32((wqe_idx << 8) | MLX5_OPCODE_RDMA_WRITE);
-
-    uint32_t *dst = (uint32_t *)ctrl_seg_ptr;
-    uint32_t *src = (uint32_t *)&ctrl_seg;
-    for (int i = 0; i < sizeof(*ctrl_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    if (av_seg_size > 0) {
-        dst = (uint32_t *)av_seg_ptr;
-        src = (uint32_t *)dct;
-        for (int i = 0; i < av_seg_size / sizeof(uint32_t); ++i)
-            ibgda_store_relaxed(&dst[i], src[i]);
-    }
-
-    dst = (uint32_t *)raddr_seg_ptr;
-    src = (uint32_t *)&raddr_seg;
-    for (int i = 0; i < sizeof(*raddr_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    dst = (uint32_t *)inl_seg_ptr;
-    src = (uint32_t *)&inl_seg;
-    for (int i = 0; i < sizeof(*inl_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    uint32_t my_base_data_idx = my_tid * bytes;
-    if (bytes <= 4) {
-        T *wqe_data_ptr;
-        if (my_base_data_idx < remaining_size_for_data_in_first_wqebb)
-            wqe_data_ptr = (T *)((uintptr_t)inl_seg_ptr + sizeof(*inl_seg_ptr) + my_base_data_idx);
-        else {
-            uint32_t my_data_idx = my_base_data_idx - remaining_size_for_data_in_first_wqebb;
-            int my_data_in_wqe_idx = my_data_idx / 64 + 1;
-            my_data_idx &= (64 - 1);  // my_data_idx % 64
-            wqe_data_ptr = (T *)((uintptr_t)out_wqes[my_data_in_wqe_idx] + my_data_idx);
-        }
-        ibgda_store_relaxed(wqe_data_ptr, val);
-    } else {
-        // wqe_data_ptr is 4-byte aligned but not 8-byte aligned.
-        assert(likely(bytes == 8 && qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC));
-        uint32_t *wqe_data_ptr;
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            uint32_t my_data_idx = my_base_data_idx + (i * 4);
-            if (my_data_idx < remaining_size_for_data_in_first_wqebb)
-                wqe_data_ptr =
-                    (uint32_t *)((uintptr_t)inl_seg_ptr + sizeof(*inl_seg_ptr) + my_data_idx);
-            else {
-                uint32_t my_idx = my_data_idx - remaining_size_for_data_in_first_wqebb;
-                int my_data_in_wqe_idx = my_idx / 64 + 1;
-                my_idx &= (64 - 1);  // my_idx % 64
-                wqe_data_ptr = (uint32_t *)((uintptr_t)out_wqes[my_data_in_wqe_idx] + my_idx);
-            }
-            ibgda_store_relaxed(wqe_data_ptr, *((uint32_t *)&val + i));
-        }
-    }
-
-    wqe_idx += nop_relative_wqe_idx;
-    ctrl_seg = {
-        0,
-    };
-    ctrl_seg.qpn_ds = HTOBE32((qp->qpn << 8) | 1);
-    ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-    ctrl_seg.opmod_idx_opcode = HTOBE32((wqe_idx << 8) | MLX5_OPCODE_NOP);
-
-    ctrl_seg_ptr = (ibgda_ctrl_seg_t *)out_wqes[nop_relative_wqe_idx];
-
-    dst = (uint32_t *)ctrl_seg_ptr;
-    src = (uint32_t *)&ctrl_seg;
-    for (int i = 0; i < sizeof(*ctrl_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
+    assert(0);
 }
 
 /**
@@ -1091,104 +893,7 @@ ibgda_write_rdma_write_inl_wqe_combine_warp_for_dci_8B(nvshmemi_ibgda_device_qp_
                                                        const T val, uint64_t _raddr, __be32 rkey,
                                                        uint16_t _wqe_idx, int my_tid,
                                                        void **out_wqes) {
-    assert(likely(sizeof(T) == 8 && dci->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI));
-
-    // base_tid = my_tid >= 16 ? 16 : 0;
-    int base_tid = my_tid & (~0xF);
-
-    // base_wqe_idx = base_tid / 4;
-    int base_out_wqe_idx = base_tid >> 2;
-
-    uint16_t wqe_idx = _wqe_idx + base_out_wqe_idx;
-
-    ibgda_ctrl_seg_t ctrl_seg;
-    struct mlx5_wqe_raddr_seg raddr_seg;
-    struct mlx5_wqe_inl_data_seg inl_seg;
-
-    ibgda_ctrl_seg_t *ctrl_seg_ptr = (ibgda_ctrl_seg_t *)out_wqes[base_out_wqe_idx];
-    void *av_seg_ptr = (void *)((uintptr_t)ctrl_seg_ptr + sizeof(*ctrl_seg_ptr));
-    struct mlx5_wqe_raddr_seg *raddr_seg_ptr;
-    struct mlx5_wqe_inl_data_seg *inl_seg_ptr;
-    uint32_t *wqe_data_ptr;
-
-    size_t av_seg_size;
-    int ds = ibgda_get_ds_in_inl_combine_warp<uint32_t, NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI>();
-
-    uint64_t raddr = _raddr - ((my_tid - base_tid) * 8);
-
-    av_seg_size = sizeof(ibgda_half_av_seg_t);
-    raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)((uintptr_t)av_seg_ptr + av_seg_size);
-    inl_seg_ptr =
-        (struct mlx5_wqe_inl_data_seg *)((uintptr_t)raddr_seg_ptr + sizeof(*raddr_seg_ptr));
-
-    raddr_seg.raddr = HTOBE64(raddr);
-    raddr_seg.rkey = rkey;
-    raddr_seg.reserved = 0;
-
-    inl_seg.byte_count = HTOBE32((8 * warpSize / 2) | MLX5_INLINE_SEG);
-
-    ctrl_seg = {
-        0,
-    };
-    ctrl_seg.qpn_ds = HTOBE32((dci->qpn << 8) | ds);
-    // ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-    // This RDMA WRITE wqe will not get CQ update to avoid dynamic size calculation in poll_cq.
-    // Instead, the NO-OP wqe (last one) will get CQ update because it is always 1 WQEBB.
-    ctrl_seg.fm_ce_se = 0;
-    ctrl_seg.opmod_idx_opcode = HTOBE32((wqe_idx << 8) | MLX5_OPCODE_RDMA_WRITE);
-
-    uint32_t *dst = (uint32_t *)ctrl_seg_ptr;
-    uint32_t *src = (uint32_t *)&ctrl_seg;
-    for (int i = 0; i < sizeof(*ctrl_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    dst = (uint32_t *)av_seg_ptr;
-    src = (uint32_t *)dct;
-    for (int i = 0; i < av_seg_size / sizeof(uint32_t); ++i) ibgda_store_relaxed(&dst[i], src[i]);
-
-    dst = (uint32_t *)raddr_seg_ptr;
-    src = (uint32_t *)&raddr_seg;
-    for (int i = 0; i < sizeof(*raddr_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    dst = (uint32_t *)inl_seg_ptr;
-    src = (uint32_t *)&inl_seg;
-    for (int i = 0; i < sizeof(*inl_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    for (int i = 0; i < 2; ++i) {
-        uint32_t my_data_idx = ((my_tid - base_tid) * 2 + i) * 4;
-        if (my_data_idx < 12)
-            wqe_data_ptr =
-                (uint32_t *)((uintptr_t)inl_seg_ptr + sizeof(*inl_seg_ptr) + my_data_idx);
-        else {
-            my_data_idx -= 12;
-            int my_data_in_wqe_idx = my_data_idx / 64 + 1;
-            my_data_idx &= (64 - 1);  // my_data_idx % 64
-            wqe_data_ptr = (uint32_t *)((uintptr_t)out_wqes[my_data_in_wqe_idx + base_out_wqe_idx] +
-                                        my_data_idx);
-        }
-
-        ibgda_store_relaxed(wqe_data_ptr, ((uint32_t *)&val)[i]);
-    }
-
-    uint32_t nop_relative_wqe_idx =
-        ibgda_get_num_wqes_in_inl_combine_warp<uint32_t, NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI>() - 1;
-
-    wqe_idx += nop_relative_wqe_idx;
-    ctrl_seg = {
-        0,
-    };
-    ctrl_seg.qpn_ds = HTOBE32((dci->qpn << 8) | 1);
-    ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-    ctrl_seg.opmod_idx_opcode = HTOBE32((wqe_idx << 8) | MLX5_OPCODE_NOP);
-
-    ctrl_seg_ptr = (ibgda_ctrl_seg_t *)out_wqes[nop_relative_wqe_idx + base_out_wqe_idx];
-
-    dst = (uint32_t *)ctrl_seg_ptr;
-    src = (uint32_t *)&ctrl_seg;
-    for (int i = 0; i < sizeof(*ctrl_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
+    assert(0);
 }
 
 template <bool support_half_av_seg>
@@ -1196,71 +901,8 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_r
     nvshmemi_ibgda_device_qp_t *qp, nvshmemi_ibgda_device_dct_t *dct, uint64_t laddr, __be32 lkey,
     uint64_t raddr, __be32 rkey, uint32_t bytes, uint16_t wqe_idx, uint8_t fm_ce_se,
     void **out_wqes) {
-    ibgda_ctrl_seg_t ctrl_seg;
-    struct mlx5_wqe_raddr_seg raddr_seg;
-    struct mlx5_wqe_data_seg data_seg;
-
-    ibgda_ctrl_seg_t *ctrl_seg_ptr = (ibgda_ctrl_seg_t *)out_wqes[0];
-    void *av_seg_ptr = (void *)((uintptr_t)ctrl_seg_ptr + sizeof(*ctrl_seg_ptr));
-    struct mlx5_wqe_raddr_seg *raddr_seg_ptr;
-    struct mlx5_wqe_data_seg *data_seg_ptr;
-
-    size_t av_seg_size;
-    int ds;
-
-    if (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) {
-        if (support_half_av_seg) {
-            ds = 4;
-            av_seg_size = sizeof(ibgda_half_av_seg_t);
-            raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)((uintptr_t)av_seg_ptr + av_seg_size);
-        } else {
-            ds = 6;
-            av_seg_size = sizeof(struct mlx5_wqe_av);
-            raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)out_wqes[1];
-        }
-    } else {
-        ds = 3;
-        av_seg_size = 0;
-        raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)((uintptr_t)av_seg_ptr + av_seg_size);
-    }
-    data_seg_ptr = (struct mlx5_wqe_data_seg *)((uintptr_t)raddr_seg_ptr + sizeof(*raddr_seg_ptr));
-
-    raddr_seg.raddr = HTOBE64(raddr);
-    raddr_seg.rkey = rkey;
-    raddr_seg.reserved = 0;
-
-    data_seg.byte_count = HTOBE32(bytes);
-    data_seg.lkey = lkey;
-    data_seg.addr = HTOBE64(laddr);
-
-    ctrl_seg = {
-        0,
-    };
-    ctrl_seg.qpn_ds = HTOBE32((qp->qpn << 8) | ds);
-    ctrl_seg.fm_ce_se = fm_ce_se;
-    ctrl_seg.opmod_idx_opcode = HTOBE32((wqe_idx << 8) | MLX5_OPCODE_RDMA_READ);
-
-    uint32_t *dst = (uint32_t *)ctrl_seg_ptr;
-    uint32_t *src = (uint32_t *)&ctrl_seg;
-    for (int i = 0; i < sizeof(*ctrl_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    if (av_seg_size > 0) {
-        dst = (uint32_t *)av_seg_ptr;
-        src = (uint32_t *)dct;
-        for (int i = 0; i < av_seg_size / sizeof(uint32_t); ++i)
-            ibgda_store_relaxed(&dst[i], src[i]);
-    }
-
-    dst = (uint32_t *)raddr_seg_ptr;
-    src = (uint32_t *)&raddr_seg;
-    for (int i = 0; i < sizeof(*raddr_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    dst = (uint32_t *)data_seg_ptr;
-    src = (uint32_t *)&data_seg;
-    for (int i = 0; i < sizeof(*data_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
+    assert(0);
+    // TBD - This can be simple same as ibgda_write_rdma_write_wqe.
 }
 
 template <typename T>
@@ -1290,328 +932,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_atomic
     nvshmemi_ibgda_device_qp_t *qp, nvshmemi_ibgda_device_dct_t *dct, const void *val_1,
     const void *val_2, uint64_t laddr, __be32 lkey, uint64_t raddr, __be32 rkey, uint32_t bytes,
     uint16_t wqe_idx, nvshmemi_amo_t amo_op, uint8_t fm_ce_se, void **out_wqes) {
-    ibgda_ctrl_seg_t ctrl_seg;
-    struct mlx5_wqe_raddr_seg raddr_seg;
-    struct mlx5_wqe_atomic_seg atomic_seg_1;
-    struct mlx5_wqe_atomic_seg atomic_seg_2;
-    struct mlx5_wqe_data_seg data_seg;
-
-    ibgda_ctrl_seg_t *ctrl_seg_ptr = (ibgda_ctrl_seg_t *)out_wqes[0];
-    void *av_seg_ptr = (void *)((uintptr_t)ctrl_seg_ptr + sizeof(*ctrl_seg_ptr));
-    struct mlx5_wqe_raddr_seg *raddr_seg_ptr;
-    struct mlx5_wqe_atomic_seg *atomic_seg_1_ptr;
-    struct mlx5_wqe_atomic_seg *atomic_seg_2_ptr;
-    struct mlx5_wqe_data_seg *data_seg_ptr;
-
-    size_t av_seg_size;
-    int ds;
-
-    if (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) {
-        if (support_half_av_seg) {
-            ds = 5;
-            av_seg_size = sizeof(ibgda_half_av_seg_t);
-            raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)((uintptr_t)av_seg_ptr + av_seg_size);
-            atomic_seg_1_ptr =
-                (struct mlx5_wqe_atomic_seg *)((uintptr_t)raddr_seg_ptr + sizeof(*raddr_seg_ptr));
-            atomic_seg_2_ptr = (struct mlx5_wqe_atomic_seg *)out_wqes[1];
-        } else {
-            ds = 7;
-            av_seg_size = sizeof(struct mlx5_wqe_av);
-            raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)out_wqes[1];
-            atomic_seg_1_ptr =
-                (struct mlx5_wqe_atomic_seg *)((uintptr_t)raddr_seg_ptr + sizeof(*raddr_seg_ptr));
-            atomic_seg_2_ptr = (struct mlx5_wqe_atomic_seg *)((uintptr_t)atomic_seg_1_ptr +
-                                                              sizeof(*atomic_seg_1_ptr));
-        }
-    } else {
-        ds = 4;
-        av_seg_size = 0;
-        raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)((uintptr_t)av_seg_ptr + av_seg_size);
-        atomic_seg_1_ptr =
-            (struct mlx5_wqe_atomic_seg *)((uintptr_t)raddr_seg_ptr + sizeof(*raddr_seg_ptr));
-        atomic_seg_2_ptr =
-            (struct mlx5_wqe_atomic_seg *)((uintptr_t)atomic_seg_1_ptr + sizeof(*atomic_seg_1_ptr));
-    }
-    data_seg_ptr = (struct mlx5_wqe_data_seg *)atomic_seg_2_ptr;
-
-    raddr_seg.raddr = HTOBE64(raddr);
-    raddr_seg.rkey = rkey;
-    raddr_seg.reserved = 0;
-
-    ctrl_seg = {
-        0,
-    };
-
-    assert(likely(bytes == 4 || bytes == 8));
-    switch (amo_op) {
-        case NVSHMEMI_AMO_FETCH_INC:
-        case NVSHMEMI_AMO_INC: {
-            if (bytes == 4) {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqe_idx << 8) |
-                                                    IBGDA_4_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_32_masked_fa_seg_t *atomic_32_masked_fa_seg =
-                    (ibgda_atomic_32_masked_fa_seg_t *)&atomic_seg_1;
-                atomic_32_masked_fa_seg->add_data = HTOBE32((uint32_t)1);
-                atomic_32_masked_fa_seg->field_boundary = 0;
-            } else {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqe_idx << 8) |
-                                                    IBGDA_8_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_64_masked_fa_seg_t *atomic_64_masked_fa_seg =
-                    (ibgda_atomic_64_masked_fa_seg_t *)&atomic_seg_1;
-                atomic_64_masked_fa_seg->add_data = HTOBE64((uint64_t)1);
-                atomic_64_masked_fa_seg->field_boundary = 0;
-            }
-            break;
-        }
-        case NVSHMEMI_AMO_SIGNAL:
-        case NVSHMEMI_AMO_SIGNAL_SET:
-        case NVSHMEMI_AMO_SWAP:
-        case NVSHMEMI_AMO_SET: {
-            if (bytes == 4) {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqe_idx << 8) |
-                                                    IBGDA_4_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_32_masked_cs_seg_t *atomic_32_masked_cs_seg =
-                    (ibgda_atomic_32_masked_cs_seg_t *)&atomic_seg_1;
-                atomic_32_masked_cs_seg->swap_data = HTOBE32(*(uint32_t *)val_1);
-                atomic_32_masked_cs_seg->compare_data = 0;
-                atomic_32_masked_cs_seg->compare_mask = 0;
-                atomic_32_masked_cs_seg->swap_mask = UINT32_MAX;
-            } else {
-                ++ds;
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqe_idx << 8) |
-                                                    IBGDA_8_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_64_masked_cs_seg_t *atomic_64_masked_cs_data_seg =
-                    (ibgda_atomic_64_masked_cs_seg_t *)&atomic_seg_1;
-                atomic_64_masked_cs_data_seg->swap = HTOBE64(*(uint64_t *)val_1);
-                atomic_64_masked_cs_data_seg->compare = 0;
-
-                ibgda_atomic_64_masked_cs_seg_t *atomic_64_masked_cs_mask_seg =
-                    (ibgda_atomic_64_masked_cs_seg_t *)&atomic_seg_2;
-                atomic_64_masked_cs_mask_seg->swap = UINT64_MAX;
-                atomic_64_masked_cs_mask_seg->compare = 0;
-
-                if (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI)
-                    data_seg_ptr =
-                        (struct mlx5_wqe_data_seg *)((uintptr_t)atomic_seg_2_ptr +
-                                                     sizeof(*atomic_64_masked_cs_mask_seg));
-                else
-                    data_seg_ptr = (struct mlx5_wqe_data_seg *)out_wqes[1];
-            }
-            break;
-        }
-        case NVSHMEMI_AMO_SIGNAL_ADD:
-        case NVSHMEMI_AMO_ADD: {
-            if (bytes == 4) {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqe_idx << 8) |
-                                                    IBGDA_4_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_32_masked_fa_seg_t *atomic_32_masked_fa_seg =
-                    (ibgda_atomic_32_masked_fa_seg_t *)&atomic_seg_1;
-                atomic_32_masked_fa_seg->add_data = HTOBE32(*(uint32_t *)val_1);
-                atomic_32_masked_fa_seg->field_boundary = 0;
-            } else {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqe_idx << 8) |
-                                                    IBGDA_8_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_64_masked_fa_seg_t *atomic_64_masked_fa_seg =
-                    (ibgda_atomic_64_masked_fa_seg_t *)&atomic_seg_1;
-                atomic_64_masked_fa_seg->add_data = HTOBE64(*(uint64_t *)val_1);
-                atomic_64_masked_fa_seg->field_boundary = 0;
-            }
-            break;
-        }
-        case NVSHMEMI_AMO_FETCH_AND:
-        case NVSHMEMI_AMO_AND: {
-            if (bytes == 4) {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqe_idx << 8) |
-                                                    IBGDA_4_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_32_masked_cs_seg_t *atomic_32_masked_cs_seg =
-                    (ibgda_atomic_32_masked_cs_seg_t *)&atomic_seg_1;
-                atomic_32_masked_cs_seg->swap_data = HTOBE32(*(uint32_t *)val_1);
-                atomic_32_masked_cs_seg->compare_data = 0;
-                atomic_32_masked_cs_seg->compare_mask = 0;
-                atomic_32_masked_cs_seg->swap_mask = HTOBE32(~(*(uint32_t *)val_1));
-            } else {
-                ++ds;
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqe_idx << 8) |
-                                                    IBGDA_8_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_64_masked_cs_seg_t *atomic_64_masked_cs_data_seg =
-                    (ibgda_atomic_64_masked_cs_seg_t *)&atomic_seg_1;
-                atomic_64_masked_cs_data_seg->swap = HTOBE64(*(uint64_t *)val_1);
-                atomic_64_masked_cs_data_seg->compare = 0;
-
-                ibgda_atomic_64_masked_cs_seg_t *atomic_64_masked_cs_mask_seg =
-                    (ibgda_atomic_64_masked_cs_seg_t *)&atomic_seg_2;
-                atomic_64_masked_cs_mask_seg->swap = HTOBE64(~(*(uint64_t *)val_1));
-                atomic_64_masked_cs_mask_seg->compare = 0;
-
-                if (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI)
-                    data_seg_ptr =
-                        (struct mlx5_wqe_data_seg *)((uintptr_t)atomic_seg_2_ptr +
-                                                     sizeof(*atomic_64_masked_cs_mask_seg));
-                else
-                    data_seg_ptr = (struct mlx5_wqe_data_seg *)out_wqes[1];
-            }
-            break;
-        }
-        case NVSHMEMI_AMO_FETCH_OR:
-        case NVSHMEMI_AMO_OR: {
-            if (bytes == 4) {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqe_idx << 8) |
-                                                    IBGDA_4_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_32_masked_cs_seg_t *atomic_32_masked_cs_seg =
-                    (ibgda_atomic_32_masked_cs_seg_t *)&atomic_seg_1;
-                atomic_32_masked_cs_seg->swap_data = HTOBE32(*(uint32_t *)val_1);
-                atomic_32_masked_cs_seg->compare_data = 0;
-                atomic_32_masked_cs_seg->compare_mask = 0;
-                atomic_32_masked_cs_seg->swap_mask = HTOBE32(*(uint32_t *)val_1);
-            } else {
-                ++ds;
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqe_idx << 8) |
-                                                    IBGDA_8_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_64_masked_cs_seg_t *atomic_64_masked_cs_data_seg =
-                    (ibgda_atomic_64_masked_cs_seg_t *)&atomic_seg_1;
-                atomic_64_masked_cs_data_seg->swap = HTOBE64(*(uint64_t *)val_1);
-                atomic_64_masked_cs_data_seg->compare = 0;
-
-                ibgda_atomic_64_masked_cs_seg_t *atomic_64_masked_cs_mask_seg =
-                    (ibgda_atomic_64_masked_cs_seg_t *)&atomic_seg_2;
-                atomic_64_masked_cs_mask_seg->swap = HTOBE64(*(uint64_t *)val_1);
-                atomic_64_masked_cs_mask_seg->compare = 0;
-
-                if (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI)
-                    data_seg_ptr =
-                        (struct mlx5_wqe_data_seg *)((uintptr_t)atomic_seg_2_ptr +
-                                                     sizeof(*atomic_64_masked_cs_mask_seg));
-                else
-                    data_seg_ptr = (struct mlx5_wqe_data_seg *)out_wqes[1];
-            }
-            break;
-        }
-        case NVSHMEMI_AMO_FETCH_XOR:
-        case NVSHMEMI_AMO_XOR: {
-            if (bytes == 4) {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqe_idx << 8) |
-                                                    IBGDA_4_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_32_masked_fa_seg_t *atomic_32_masked_fa_seg =
-                    (ibgda_atomic_32_masked_fa_seg_t *)&atomic_seg_1;
-                atomic_32_masked_fa_seg->add_data = HTOBE32(*(uint32_t *)val_1);
-                atomic_32_masked_fa_seg->field_boundary = UINT32_MAX;
-            } else {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqe_idx << 8) |
-                                                    IBGDA_8_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_64_masked_fa_seg_t *atomic_64_masked_fa_seg =
-                    (ibgda_atomic_64_masked_fa_seg_t *)&atomic_seg_1;
-                atomic_64_masked_fa_seg->add_data = HTOBE64(*(uint64_t *)val_1);
-                atomic_64_masked_fa_seg->field_boundary = UINT64_MAX;
-            }
-            break;
-        }
-        case NVSHMEMI_AMO_FETCH: {
-            if (bytes == 4) {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqe_idx << 8) |
-                                                    IBGDA_4_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_32_masked_fa_seg_t *atomic_32_masked_fa_seg =
-                    (ibgda_atomic_32_masked_fa_seg_t *)&atomic_seg_1;
-                atomic_32_masked_fa_seg->add_data = 0;
-                atomic_32_masked_fa_seg->field_boundary = 0;
-            } else {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqe_idx << 8) |
-                                                    IBGDA_8_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_64_masked_fa_seg_t *atomic_64_masked_fa_seg =
-                    (ibgda_atomic_64_masked_fa_seg_t *)&atomic_seg_1;
-                atomic_64_masked_fa_seg->add_data = 0;
-                atomic_64_masked_fa_seg->field_boundary = 0;
-            }
-            break;
-        }
-        case NVSHMEMI_AMO_FETCH_ADD: {
-            if (bytes == 4) {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqe_idx << 8) |
-                                                    IBGDA_4_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_32_masked_fa_seg_t *atomic_32_masked_fa_seg =
-                    (ibgda_atomic_32_masked_fa_seg_t *)&atomic_seg_1;
-                atomic_32_masked_fa_seg->add_data = HTOBE32(*(uint32_t *)val_1);
-                atomic_32_masked_fa_seg->field_boundary = 0;
-            } else {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_FA | (wqe_idx << 8));
-                atomic_seg_1.swap_add = HTOBE64(*(uint64_t *)val_1);
-            }
-            break;
-        }
-        case NVSHMEMI_AMO_COMPARE_SWAP: {
-            if (bytes == 4) {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqe_idx << 8) |
-                                                    IBGDA_4_BYTE_EXT_AMO_OPMOD);
-
-                ibgda_atomic_32_masked_cs_seg_t *atomic_32_masked_cs_seg =
-                    (ibgda_atomic_32_masked_cs_seg_t *)&atomic_seg_1;
-                atomic_32_masked_cs_seg->swap_data = HTOBE32(*(uint32_t *)val_1);
-                atomic_32_masked_cs_seg->compare_data = HTOBE32(*(uint32_t *)val_2);
-                atomic_32_masked_cs_seg->compare_mask = UINT32_MAX;
-                atomic_32_masked_cs_seg->swap_mask = UINT32_MAX;
-            } else {
-                ctrl_seg.opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_CS | (wqe_idx << 8));
-                atomic_seg_1.swap_add = HTOBE64(*(uint64_t *)val_1);
-                atomic_seg_1.compare = HTOBE64(*(uint64_t *)val_2);
-            }
-            break;
-        }
-        default: { assert(0); }
-    }
-
-    ctrl_seg.qpn_ds = HTOBE32((qp->qpn << 8) | ds);
-
-    data_seg.byte_count = HTOBE32(bytes);
-    data_seg.lkey = lkey;
-    data_seg.addr = HTOBE64(laddr);
-
-    ctrl_seg.fm_ce_se = fm_ce_se;
-
-    uint32_t *dst = (uint32_t *)ctrl_seg_ptr;
-    uint32_t *src = (uint32_t *)&ctrl_seg;
-    for (int i = 0; i < sizeof(*ctrl_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    if (av_seg_size > 0) {
-        dst = (uint32_t *)av_seg_ptr;
-        src = (uint32_t *)dct;
-        for (int i = 0; i < av_seg_size / sizeof(uint32_t); ++i)
-            ibgda_store_relaxed(&dst[i], src[i]);
-    }
-
-    dst = (uint32_t *)raddr_seg_ptr;
-    src = (uint32_t *)&raddr_seg;
-    for (int i = 0; i < sizeof(*raddr_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    dst = (uint32_t *)atomic_seg_1_ptr;
-    src = (uint32_t *)&atomic_seg_1;
-    for (int i = 0; i < sizeof(*atomic_seg_1_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    dst = (uint32_t *)atomic_seg_2_ptr;
-    src = (uint32_t *)&atomic_seg_2;
-    for (int i = 0; i < sizeof(*atomic_seg_2_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
-
-    dst = (uint32_t *)data_seg_ptr;
-    src = (uint32_t *)&data_seg;
-    for (int i = 0; i < sizeof(*data_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
+    assert(0);
 }
 
 __device__ void bnxt_re_init_db_hdr(struct bnxt_re_db_hdr *hdr,
@@ -2080,7 +1401,7 @@ ibgda_cst(nvshmemi_ibgda_device_qp_t *dci, bool is_dci_shared_among_ctas) {
 
     // DUMP OP causes the NIC to read laddr, which is always on GPU memory.
     // For CST, it is cheaper than RDMA READ.
-    ibgda_write_dump_wqe(dci, laddr, lkey, sizeof(char), base_wqe_idx, IBGDA_MLX5_FM_NO_FENCE,
+    ibgda_write_dump_wqe(dci, laddr, lkey, sizeof(char), base_wqe_idx, 0,
                          wqe_ptrs);
 
     // Don't update get_head here because this is internal cst
@@ -2114,8 +1435,7 @@ ibgda_quiet_with_cst(nvshmemi_ibgda_device_qp_t *qp, bool is_qp_shared_among_cta
         // In that case, we don't have to do quiet first
         if (get_tail < get_head) {
             if (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) {
-                ticket = ibgda_cst(qp, is_qp_shared_among_ctas);
-                ibgda_update_get_tail(qp, ticket);
+                    assert(0);
             } else {
                 // We don't have RC loopback to self.
                 // So, we grab a DCI for CST.
@@ -2217,8 +1537,8 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma_thread(
         wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
 
         // Generate CQE only if we create the last WQE in the group.
-        uint8_t fm_ce_se =
-            (!need_additional_wqe && (my_tid == tg_size - 1)) ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
+        // TBD - Check this
+        uint8_t fm_ce_se = 0;
 
         switch (channel_op) {
             case NVSHMEMI_OP_PUT:
@@ -2250,7 +1570,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma_thread(
                 my_wqe_idx += num_wqes_per_cmd;
                 wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
                 ibgda_write_dump_wqe(qp, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sizeof(char),
-                                     my_wqe_idx, IBGDA_MLX5_FM_FENCE, wqe_ptrs);
+                                     my_wqe_idx, 2 << 5, wqe_ptrs);
             } else {
                 if (need_additional_wqe) {
                     my_wqe_idx += num_wqes_per_cmd;
@@ -2418,7 +1738,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma(uint64_t
     my_wqe_idx = base_wqe_idx + (my_tid * num_wqes_per_cmd);
 
     // Generate CQE only if we create the last WQE in the group.
-    fm_ce_se = (!need_additional_wqe && (my_tid == chunk_idx - 1)) ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
+    fm_ce_se = 0;
 
     if (my_tid < chunk_idx) {
         wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
@@ -2453,7 +1773,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma(uint64_t
             // waits for all prior READ/ATOMIC to finish before issuing this
             // DUMP.
             ibgda_write_dump_wqe(qp, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sizeof(char),
-                                 my_wqe_idx, IBGDA_MLX5_FM_FENCE, wqe_ptrs);
+                                 my_wqe_idx, 2 << 5, wqe_ptrs);
         } else {
             if (need_additional_wqe) {
                 my_wqe_idx += num_wqes_per_cmd;
@@ -2576,8 +1896,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_rma
     }
 
     // Generate CQE only if we create the last WQE in the group.
-    uint8_t fm_ce_se =
-        (!need_additional_wqe && (my_tid == tg_size - 1)) ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
+    uint8_t fm_ce_se = 0;
 
     uint64_t my_wqe_idx =
         can_combine_data ? base_wqe_idx : base_wqe_idx + (my_tid * num_wqes_per_cmd);
@@ -2661,139 +1980,9 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_rma_p(void *rptr, c
 template <typename T, bool support_half_av_seg>
 __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE T nvshmemi_ibgda_rma_g_impl(void *rptr, int dst_pe,
                                                                      int proxy_pe) {
-    unsigned int amask = __activemask();
-    int my_tid;
-    int tg_size;
-
-    nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
-    const bool need_cst = !state->may_skip_cst;
-
-    uint64_t base_wqe_idx;
-    uint64_t base_ibuf_idx;
-
-    T ret;
-
-    int is_qp_shared_among_ctas;
-    nvshmemi_ibgda_device_dct_t *dct;
-    nvshmemi_ibgda_device_qp_t *qp;
-
-    __be32 rkey;
-    uint64_t raddr;
-    size_t rchunk_size;
-
-    bool can_coalesce_warp = ibgda_can_coalesce_warp_pe(amask, proxy_pe);
-    bool can_combine_data = false;
-    int pred_contiguous = 0;
-    int pred_rkey = 0;
-
-    if (can_coalesce_warp) {
-        my_tid = nvshmemi_thread_id_in_threadgroup<NVSHMEMI_THREADGROUP_WARP>();
-        tg_size = nvshmemi_threadgroup_size<NVSHMEMI_THREADGROUP_WARP>();
-        if (my_tid == 0) {
-            qp = ibgda_get_qp(proxy_pe, (bool *)&is_qp_shared_among_ctas);
-        }
-        qp = (nvshmemi_ibgda_device_qp_t *)__shfl_sync(IBGDA_FULL_WARP, (uintptr_t)qp, 0);
-        is_qp_shared_among_ctas = __shfl_sync(IBGDA_FULL_WARP, is_qp_shared_among_ctas, 0);
-        ibgda_get_raddr_rkey((uint64_t)rptr, dst_pe, proxy_pe, &raddr, &rkey, &rchunk_size,
-                             qp->dev_idx);
-
-        __match_all_sync(IBGDA_FULL_WARP, (uintptr_t)(rptr) - (my_tid * sizeof(T)),
-                         &pred_contiguous);
-        __match_all_sync(IBGDA_FULL_WARP, rkey, &pred_rkey);
-        can_combine_data = (pred_contiguous && pred_rkey);
-    } else {
-        my_tid = nvshmemi_thread_id_in_threadgroup<NVSHMEMI_THREADGROUP_THREAD>();
-        tg_size = nvshmemi_threadgroup_size<NVSHMEMI_THREADGROUP_THREAD>();
-        qp = ibgda_get_qp(proxy_pe, (bool *)&is_qp_shared_among_ctas);
-        ibgda_get_raddr_rkey((uint64_t)rptr, dst_pe, proxy_pe, &raddr, &rkey, &rchunk_size,
-                             qp->dev_idx);
-    }
-    dct = ibgda_get_dct(proxy_pe, qp->dev_idx);
-
-    const bool need_additional_wqe =
-        need_cst || ((qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) && !support_half_av_seg);
-
-    int num_wqes_per_cmd =
-        (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) ? (support_half_av_seg ? 1 : 2) : 1;
-
-    int num_wqes = (can_combine_data ? num_wqes_per_cmd : num_wqes_per_cmd * tg_size) +
-                   (need_additional_wqe ? 1 : 0);
-
-    int num_ibuf_slots = can_coalesce_warp ? 1 : tg_size;
-
-    if (my_tid == 0) {
-        base_ibuf_idx = ibgda_reserve_ibuf_slots(qp, num_ibuf_slots);
-        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas);
-    }
-
-    if (can_coalesce_warp) {
-        base_wqe_idx = __shfl_sync(amask, base_wqe_idx, 0);
-        base_ibuf_idx = __shfl_sync(amask, base_ibuf_idx, 0);
-    }
-
-    uint64_t my_wqe_idx =
-        can_combine_data ? base_wqe_idx : base_wqe_idx + (my_tid * num_wqes_per_cmd);
-    uint64_t my_ibuf_idx = can_coalesce_warp ? base_ibuf_idx : base_ibuf_idx + my_tid;
-
-    void *wqe_ptrs[2];
-    wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-    wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
-
-    uint64_t laddr =
-        ibgda_get_ibuf_addr(qp, my_ibuf_idx) + (can_coalesce_warp ? my_tid * sizeof(T) : 0);
-    __be32 lkey = qp->ibuf.lkey;
-
-    // Generate CQE only if we create the last WQE in the group.
-    uint8_t fm_ce_se = (!need_additional_wqe && ((can_combine_data && (my_tid == 0)) ||
-                                                 (!can_combine_data && (my_tid == tg_size - 1))))
-                           ? MLX5_WQE_CTRL_CQ_UPDATE
-                           : 0;
-
-    if (!can_combine_data) {
-        ibgda_write_rdma_read_wqe<support_half_av_seg>(qp, dct, laddr, lkey, raddr, rkey, sizeof(T),
-                                                       my_wqe_idx, fm_ce_se, wqe_ptrs);
-
-    } else if (my_tid == 0) {
-        ibgda_write_rdma_read_wqe<support_half_av_seg>(
-            qp, dct, laddr, lkey, raddr, rkey, sizeof(T) * tg_size, my_wqe_idx, fm_ce_se, wqe_ptrs);
-    }
-
-    if (can_coalesce_warp) nvshmemi_warp_sync();
-
-    if (need_additional_wqe && (my_tid == (tg_size - 1))) {
-        my_wqe_idx += num_wqes_per_cmd;
-        wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-        fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-
-        if (need_cst)
-            // Enqueue CST op in the QP.  This command has NIC Fence, which
-            // waits for all prior READ/ATOMIC to finish before issuing this
-            // DUMP.
-            ibgda_write_dump_wqe(qp, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sizeof(char),
-                                 my_wqe_idx, IBGDA_MLX5_FM_FENCE, wqe_ptrs);
-        else
-            ibgda_write_nop_wqe(qp, my_wqe_idx, wqe_ptrs);
-    }
-    if (fm_ce_se > 0) {
-        if (is_qp_shared_among_ctas)
-            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes);
-        else
-            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes);
-
-        ibgda_quiet(qp);
-    }
-
-    if (can_coalesce_warp) nvshmemi_warp_sync();
-
-    ret = READ_ONCE(*(T *)laddr);
-
-    if (can_coalesce_warp) nvshmemi_warp_sync();
-
-    if (my_tid == tg_size - 1) ibgda_release_ibuf(qp, base_ibuf_idx, num_ibuf_slots);
-
-    if (can_coalesce_warp) nvshmemi_warp_sync();
-
-    return ret;
+    assert(0);
+    return false;
+    // TBD -
 }
 
 template <typename T>
@@ -2920,8 +2109,7 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_amo_nonfetch_impl(v
     wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
     wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
 
-    uint8_t fm_ce_se =
-        (!need_additional_wqe && (my_tid == tg_size - 1)) ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
+    uint8_t fm_ce_se = 0;
 
     ibgda_write_atomic_wqe<support_half_av_seg>(qp, dct, &value, NULL, (uint64_t)qp->ibuf.buf,
                                                 qp->ibuf.lkey, raddr, rkey, sizeof(T), my_wqe_idx,
@@ -3028,8 +2216,7 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE T nvshmemi_ibgda_amo_fetch_impl(void *r
     wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
     wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
 
-    uint8_t fm_ce_se =
-        (!need_additional_wqe && (my_tid == tg_size - 1)) ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
+    uint8_t fm_ce_se = 0;
 
     ibgda_write_atomic_wqe<support_half_av_seg>(qp, dct, &value, &compare, laddr, lkey, raddr, rkey,
                                                 sizeof(T), my_wqe_idx, op, fm_ce_se, wqe_ptrs);
@@ -3046,7 +2233,7 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE T nvshmemi_ibgda_amo_fetch_impl(void *r
                 // waits for all prior READ/ATOMIC to finish before issuing this
                 // DUMP.
                 ibgda_write_dump_wqe(qp, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sizeof(char),
-                                     my_wqe_idx, IBGDA_MLX5_FM_FENCE, wqe_ptrs);
+                                     my_wqe_idx, 2 << 5, wqe_ptrs);
             else
                 ibgda_write_nop_wqe(qp, my_wqe_idx, wqe_ptrs);
         }
@@ -3179,7 +2366,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
         ibgda_write_rdma_write_wqe<support_half_av_seg>(qp, dct, (uint64_t)lptr, lkey, raddr, rkey,
                                                         bytes, my_wqe_idx, 0, wqe_ptrs);
 
-        fm_ce_se = (!need_additional_wqe && (my_tid == tg_size - 1)) ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
+        fm_ce_se = 0;
 
         ibgda_write_atomic_wqe<support_half_av_seg>(
             qp, dct, &signal, NULL, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sig_raddr, sig_rkey,
@@ -3225,7 +2412,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
         wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
         wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
 
-        fm_ce_se = (!need_additional_wqe) ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
+        fm_ce_se = 0;
 
         ibgda_write_atomic_wqe<support_half_av_seg>(
             qp, dct, &signal, NULL, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sig_raddr, sig_rkey,
@@ -3379,7 +2566,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
         ibgda_get_raddr_rkey((uint64_t)sig_rptr, pe, pe, &sig_raddr, &sig_rkey, &sig_rchunk_size,
                              qp->dev_idx);
 
-        uint8_t fm_ce_se = (!need_additional_wqe) ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
+        uint8_t fm_ce_se = 0;
 
         ibgda_write_atomic_wqe<support_half_av_seg>(
             qp, dct, &signal, NULL, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sig_raddr, sig_rkey,
@@ -3537,6 +2724,7 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_enforce_consistency
                                  // cst_ack_d (breaks cst -> rma)
     }
 }
+
 
 #endif /* __CUDA_ARCH__ */
 
