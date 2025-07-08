@@ -19,8 +19,21 @@
 #include "device_host_transport/nvshmem_common_ibgda.h"
 #include "non_abi/nvshmem_build_options.h"
 #include "utils_device.h"
+#include "bnxt_re_fp_defs.h"
 
 #include <algorithm>
+
+#undef HTOLE16
+#define HTOLE16(x)        (x)
+
+#undef HTOLE32
+#define HTOLE32(x)        (x)
+
+#undef HTOLE64
+#define HTOLE64(x)        (x)
+
+#undef LE32TOH
+#define LE32TOH(x)        (x)
 
 //#define NVSHMEM_IBGDA_DEBUG
 //#define NVSHMEM_TIMEOUT_DEVICE_POLLING
@@ -111,6 +124,7 @@ enum {
 };
 
 typedef struct mlx5_wqe_ctrl_seg __attribute__((__aligned__(8))) ibgda_ctrl_seg_t;
+typedef struct bnxt_re_bsqe __attribute__((__aligned__(8))) ibgda_bnxt_ctrl_seg_t;
 
 // The ext flag (in dqp_dct) must be set to disable.
 typedef struct {
@@ -420,33 +434,30 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_check_poll_ti
     nvshmemi_ibgda_device_cq_t *cq, uint64_t now, uint64_t start, uint64_t idx, int *error) {
     int status = 0;
 
-    struct mlx5_cqe64 *cqe64 = (struct mlx5_cqe64 *)cq->cqe;
-    uint8_t opown;
-    uint8_t opcode;
-    uint16_t wqe_counter;
-
     if (unlikely(now - start > IBGDA_POLL_TIMEOUT)) {
         *error = -ETIME;
-
-        opown = ibgda_atomic_read(&cqe64->op_own);
-        opcode = opown >> 4;
-
-        wqe_counter = ibgda_atomic_read(&cqe64->wqe_counter);
-        wqe_counter = BSWAP16(wqe_counter);
-
+        /*
         printf(
             "[%d] ibgda_poll_cq timeout:\n"
-            "    cons_idx=%#lx, prod_idx=%#lx, cqn=%#x, qpn=%#x, opcode=%#x\n"
-            "    wqe_counter=%#x, resv_head=%#lx, ready_head=%#lx\n"
-            "    while waiting for idx=%#lx.\n",
+            "    cons_idx=%#lx, prod_idx=%#lx, cqn=%#x, qpn=%#x\n"
+            "    resv_head=%#lx, ready_head=%#lx\n"
+            "    while waiting for idx=%#lx\n",
             nvshmemi_device_state_d.mype, ibgda_atomic_read(cq->cons_idx),
-            ibgda_atomic_read(cq->prod_idx), cq->cqn, cq->qpn, opcode, wqe_counter,
-            ibgda_atomic_read(cq->resv_head), ibgda_atomic_read(cq->ready_head), idx);
+            ibgda_atomic_read(cq->prod_idx), cq->cqn, cq->qpn,
+            ibgda_atomic_read(cq->resv_head),
+            ibgda_atomic_read(cq->ready_head), idx);
         status = -1;
+        */
     }
     return status;
 }
 #endif
+
+#define bnxt_re_get_cqe_sz()    (sizeof(struct bnxt_re_req_cqe) +   \
+                 sizeof(struct bnxt_re_bcqe))
+
+#define bnxt_re_is_cqe_valid(valid, phase)              \
+                (((valid) & BNXT_RE_BCQE_PH_MASK) == (phase))
 
 #if __cplusplus >= 201103L
 static_assert(NVSHMEMI_IBGDA_MAX_QP_DEPTH <= 32768,
@@ -455,53 +466,88 @@ static_assert(NVSHMEMI_IBGDA_MAX_QP_DEPTH <= 32768,
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
     nvshmemi_ibgda_device_cq_t *cq, uint64_t idx, int *error) {
     int status = 0;
-    struct mlx5_cqe64 *cqe64 = (struct mlx5_cqe64 *)cq->cqe;
-
-    const uint32_t ncqes = cq->ncqes;
-
-    uint8_t opown;
-    uint8_t opcode;
-    uint16_t wqe_counter;
-    uint16_t new_wqe_counter;
+    struct bnxt_re_req_cqe *cqe64_bnxt = (struct bnxt_re_req_cqe *)cq->cqe;
 
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
     uint64_t start = ibgda_query_globaltimer();
     uint64_t now;
 #endif
+    bnxt_re_bcqe *hdr;
+    uint32_t flg_val;
+    struct bnxt_re_req_cqe *hwcqe = (struct bnxt_re_req_cqe *)cq->cqe;
 
-    uint64_t cons_idx = ibgda_atomic_read(cq->cons_idx);
-    uint64_t new_cons_idx;
+    auto cons_idx = ibgda_atomic_read(cq->cons_idx);
+    auto prod_idx = ibgda_atomic_read(cq->prod_idx);
+    auto resv_head = ibgda_atomic_read(cq->resv_head);
+    auto ready_head = ibgda_atomic_read(cq->ready_head);
+    bool valid_comp = false;
+    uint8_t cqe_status = 0;
 
     assert(likely(cq->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI ||
                   cq->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC));
 
-    if (unlikely(cons_idx >= idx)) goto out;
+    // Handle some CQ polling TBD. CQ poll might be called for periodic
+    // check and it is possible to have no potential completion on that CQ.
+    // Currently it is handled through timeout.
+    do {
+        cons_idx = ibgda_atomic_read(cq->cons_idx);
+        prod_idx = ibgda_atomic_read(cq->prod_idx);
+        resv_head = ibgda_atomic_read(cq->resv_head);
+        ready_head = ibgda_atomic_read(cq->ready_head);
+
+        hwcqe = (struct bnxt_re_req_cqe *)((unsigned long)cq->cqe +
+                 (cons_idx * bnxt_re_get_cqe_sz()));
+        hdr = (bnxt_re_bcqe*)((unsigned long)hwcqe + sizeof(bnxt_re_req_cqe));
+        flg_val = LE32TOH(hdr->flg_st_typ_ph);
 
 #ifdef NVSHMEM_IBGDA_DEBUG
-    // We can skip opcode == MLX5_CQE_INVALID check because we have already
-    // initialized the CQ buffer to 0xff. With the QP depth range we enforce,
-    // cons_idx cannot progress unless wqe_counter read from the CQ buffer is
-    // a valid value.
-    do {
-        opown = ibgda_atomic_read(&cqe64->op_own);
-        opcode = opown >> 4;
+        uint32_t *cqe_slot;
+        int i;
 
+        cqe_slot = (uint32_t *)(uint32_t*)hwcqe;
+        for (i = 0; i < 4; i++) {
+            printf("hwcqe 0x%lx : %08x %08x %08x %08x (cqn %d slot %ld)\n",
+                 &cqe_slot[0], (cqe_slot[1]), (cqe_slot[0]),
+                 (cqe_slot[3]), (cqe_slot[2]), cq->cqn, cons_idx + i);
+            cqe_slot = cqe_slot + 4;
+        }
+        printf("qpn %d cqn %d flg_val %08x  ready_head 0x%lx resv_head 0x%lx"
+            "idx from caller 0x%lx tx prod 0x%lx tx cons 0x%lx (hw sq_cons 0x%x) phase 0x%x\n",
+            cq->qpn, cq->cqn, flg_val, ibgda_atomic_read(cq->resv_head),
+            ibgda_atomic_read(cq->ready_head), idx,
+            prod_idx, cons_idx, hwcqe->con_indx, cq->phase);
+#endif
+
+        if (bnxt_re_is_cqe_valid(flg_val, cq->phase)) {
+            // TBD - Fix below
+            if (!++cons_idx) {
+                cq->phase = !cq->phase;
+            }
+            cqe_status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) &
+                          BNXT_RE_BCQE_STATUS_MASK;
+            valid_comp = true;
+            // cq->cons_idx is local tracking of consumer of CQ.
+            *cq->cons_idx = cons_idx;
+            if (!cqe_status)
+                goto check_opcode;
+        }
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
         // TODO: Integrate timeout handler with the core NVSHMEM
         now = ibgda_query_globaltimer();
         status = ibgda_check_poll_timeout(cq, now, start, idx, error);
         if (status != 0) goto check_opcode;
-#endif /* NVSHMEM_TIMEOUT_DEVICE_POLLING */
-    } while (unlikely(opcode == MLX5_CQE_INVALID));
+#endif
+        // TBD - We need proper handling here.
+        // Poll might be called for those CQs as well, which has never
+        // done any posting.
+    } while (resv_head != ready_head);
 
     // Prevent reordering of the opcode wait above
     IBGDA_MFENCE();
-#endif /* NVSHMEM_IBGDA_DEBUG */
 
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
     start = ibgda_query_globaltimer();
 #endif
-
     // If idx is a lot greater than cons_idx, we might get incorrect result due
     // to wqe_counter wraparound. We need to check prod_idx to be sure that idx
     // has already been submitted.
@@ -509,71 +555,23 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
         ;
     IBGDA_MFENCE();
 
-    do {
-        new_wqe_counter = ibgda_atomic_read(&cqe64->wqe_counter);
-        new_wqe_counter = BSWAP16(new_wqe_counter);
-#ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
-        now = ibgda_query_globaltimer();
-        status = ibgda_check_poll_timeout(cq, now, start, idx, error);
-        if (status != 0) goto check_opcode;
-
-        // Observe progress. Reset the timer.
-        if (new_wqe_counter != wqe_counter) start = now;
-#endif
-        wqe_counter = new_wqe_counter;
-
-        // Another thread may have updated cons_idx.
-        cons_idx = ibgda_atomic_read(cq->cons_idx);
-        if (likely(cons_idx >= idx)) goto out;
-    }
-    // NOTE: This while loop is part of do while above.
-    // wqe_counter is the HW consumer index. However, we always maintain index
-    // + 1 in SW. To be able to compare with idx, we need to use wqe_counter +
-    // 1. Because wqe_counter is uint16_t, it may wraparound. Still we know for
-    // sure that if idx - wqe_counter - 1 < ncqes, wqe_counter + 1 is less than
-    // idx, and thus we need to wait. We don't need to wait when idx ==
-    // wqe_counter + 1. That's why we use - (uint16_t)2 here to make this case
-    // wraparound.
-    while (unlikely(((uint16_t)((uint16_t)idx - wqe_counter - (uint16_t)2) < ncqes)));
-
-    // new_cons_idx is uint64_t but wqe_counter is uint16_t. Thus, we get the
-    // MSB from idx. We also need to take care of wraparound.
-    ++wqe_counter;
-    new_cons_idx =
-        (idx & ~(0xffffULL) | wqe_counter) + (((uint16_t)idx > wqe_counter) ? 0x10000ULL : 0x0);
-    atomicMax((unsigned long long int *)cq->cons_idx, (unsigned long long int)new_cons_idx);
-
-#ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
 check_opcode:
-#endif
+    /* TBD CQE_REQ_ERR Case handling*/
 
-    // NVSHMEM always treats CQE errors as fatal.
-    // Even if this error doesn't belong to the CQE in cons_idx,
-    // we will just report and terminate the process.
-    opown = ibgda_atomic_read(&cqe64->op_own);
-    opcode = opown >> 4;
-
-    if (unlikely(opcode == MLX5_CQE_REQ_ERR)) {
-        ibgda_mlx5_err_cqe_t *cqe_err = (ibgda_mlx5_err_cqe_t *)cqe64;
-        *error = cqe_err->syndrome;
-#ifdef NVSHMEM_IBGDA_DEBUG
-        __be16 wqe_counter = ibgda_atomic_read(&cqe_err->wqe_counter);
-        __be32 s_wqe_opcode_qpn = ibgda_atomic_read(&cqe_err->s_wqe_opcode_qpn);
-        printf(
-            "[%d] got completion with err:\n"
-            "   syndrome=%#x, vendor_err_synd=%#x, hw_err_synd=%#x, hw_synd_type=%#x,\n"
-            "   wqe_counter=%#x, s_wqe_opcode_qpn=%#x,\n"
-            "   cqn=%#x, cons_idx=%#lx, prod_idx=%#lx, idx=%#lx\n",
-            nvshmemi_device_state_d.mype, cqe_err->syndrome, cqe_err->vendor_err_synd,
-            cqe_err->hw_err_synd, cqe_err->hw_synd_type, BSWAP16(wqe_counter),
-            BSWAP32(s_wqe_opcode_qpn), cq->cqn, cons_idx, ibgda_atomic_read(cq->prod_idx), idx);
-#endif /* NVSHMEM_IBGDA_DEBUG */
-        status = -1;
-    }
-
-out:
     // Prevent reordering of this function and subsequent instructions
     IBGDA_MFENCE();
+#ifdef NVSHMEM_IBGDA_DEBUG
+    printf(
+        "[%d] ibgda_poll_cq %s: \n"
+        "    cons_idx=%#lx, prod_idx=%#lx, cqn=%#x, qpn=%#x \n"
+        "    resv_head=%#lx, ready_head=%#lx\n"
+        "    while waiting for idx=%#lx. handle=0x%llx cqe_status 0x%x\n",
+        nvshmemi_device_state_d.mype, valid_comp ? "SUCESS" : "TIMEOUT",
+        cons_idx, prod_idx, cq->cqn, cq->qpn,
+        ibgda_atomic_read(cq->resv_head), ibgda_atomic_read(cq->ready_head), idx,
+        ibgda_atomic_read((uint64_t*)&cqe64_bnxt->qp_handle),
+        cqe_status);
+#endif
 
     return status;
 }
@@ -633,75 +631,136 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_dump_w
         ibgda_store_relaxed(&dst[i], src[i]);
 }
 
+#if 0
+// These MSN table routines need to change to cp the entire 64b into the GPU memory instead
+__device__ void *bnxt_re_pull_psn_buff(nvshmemi_ibgda_device_qp_t *qp) {
+   // MSN entries are 64b wide << 4
+   return (void *)(((char *) qp->pad) + ((qp->msn) << 4));
+}
+
+__device__ uint64_t bnxt_re_update_msn_tbl(uint32_t st_idx, uint32_t npsn, uint32_t start_psn) {
+   /* Adjust the field values to their respective ofsets */
+   /* In LE64 */
+   return ((((uint64_t)(st_idx) << BNXT_RE_SQ_MSN_SEARCH_START_IDX_SHIFT) &
+                       BNXT_RE_SQ_MSN_SEARCH_START_IDX_MASK) |
+                       (((uint64_t)(npsn) << BNXT_RE_SQ_MSN_SEARCH_NEXT_PSN_SHIFT) &
+                       BNXT_RE_SQ_MSN_SEARCH_NEXT_PSN_MASK) |
+                       (((start_psn) << BNXT_RE_SQ_MSN_SEARCH_START_PSN_SHIFT) &
+                       BNXT_RE_SQ_MSN_SEARCH_START_PSN_MASK));
+}
+
+__device__ void bnxt_re_fill_psns_for_msntbl(nvshmemi_ibgda_device_qp_t *qp, uint32_t len,
+                                            uint16_t wqe_idx) {
+   uint32_t npsn = 0, start_psn = 0, next_psn = 0;
+   struct bnxt_re_msns msns;
+   struct bnxt_re_msns *msns_ptr;
+   uint32_t pkt_cnt = 0;
+   /* Start slot index of the WQE */
+   uint32_t st_idx = wqe_idx * BNXT_RE_STATIC_WQE_SIZE_SLOTS;
+
+   // Get the MSN table address
+   msns_ptr = (struct bnxt_re_msns *)bnxt_re_pull_psn_buff(qp);
+
+   // Start PSN is the last recorded PSN
+   // Calculate the packet count based on the len of the WQE/MTU
+   msns.start_idx_next_psn_start_psn = 0;
+   start_psn = qp->sq_psn;
+   pkt_cnt = (len / qp->mtu);
+
+   if (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC) {
+       if (len % qp->mtu)
+           pkt_cnt++;
+       /* Increment the psn even for 0 len packets
+        * e.g. for opcode rdma-write-with-imm-data
+        * with length field = 0
+        */
+       if (len == 0)
+           pkt_cnt = 1;
+
+       /* make it 24 bit */
+       next_psn = qp->sq_psn + pkt_cnt;
+       npsn = next_psn;
+       qp->sq_psn = next_psn;
+       msns.start_idx_next_psn_start_psn |= bnxt_re_update_msn_tbl(st_idx, npsn, start_psn);
+       qp->msn++;
+       qp->msn %= qp->msn_tbl_sz;
+   }
+   uint32_t *dst = (uint32_t *)msns_ptr;
+   uint32_t *src = (uint32_t *)&msns;
+   for (int i = 0; i < sizeof(*msns_ptr) / sizeof(uint32_t); ++i)
+       ibgda_store_release(&dst[i], *(uint64_t *)(&src[i]));
+}
+#endif
+
 template <bool support_half_av_seg>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_write_wqe(
     nvshmemi_ibgda_device_qp_t *qp, nvshmemi_ibgda_device_dct_t *dct, uint64_t laddr, __be32 lkey,
     uint64_t raddr, __be32 rkey, uint32_t bytes, uint16_t wqe_idx, uint8_t fm_ce_se,
     void **out_wqes) {
-    ibgda_ctrl_seg_t ctrl_seg;
-    struct mlx5_wqe_raddr_seg raddr_seg;
-    struct mlx5_wqe_data_seg data_seg;
+    ibgda_bnxt_ctrl_seg_t ctrl_seg;
+    struct bnxt_re_rdma raddr_seg;
+    struct bnxt_re_sge data_seg, data_seg2;
 
-    ibgda_ctrl_seg_t *ctrl_seg_ptr = (ibgda_ctrl_seg_t *)out_wqes[0];
-    void *av_seg_ptr = (void *)((uintptr_t)ctrl_seg_ptr + sizeof(*ctrl_seg_ptr));
-    struct mlx5_wqe_raddr_seg *raddr_seg_ptr;
-    struct mlx5_wqe_data_seg *data_seg_ptr;
+    // All segments are within the same WQE
+    ibgda_bnxt_ctrl_seg_t *ctrl_seg_ptr = (ibgda_bnxt_ctrl_seg_t *)out_wqes[0];
 
-    size_t av_seg_size;
-    int ds;
+    assert(likely(qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC));
 
-    if (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) {
-        if (support_half_av_seg) {
-            ds = 4;
-            av_seg_size = sizeof(ibgda_half_av_seg_t);
-            raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)((uintptr_t)av_seg_ptr + av_seg_size);
-        } else {
-            ds = 6;
-            av_seg_size = sizeof(struct mlx5_wqe_av);
-            raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)out_wqes[1];
-        }
-    } else {
-        ds = 3;
-        av_seg_size = 0;
-        raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)((uintptr_t)av_seg_ptr + av_seg_size);
-    }
-    data_seg_ptr = (struct mlx5_wqe_data_seg *)((uintptr_t)raddr_seg_ptr + sizeof(*raddr_seg_ptr));
+    auto raddr_seg_ptr = reinterpret_cast<struct bnxt_re_rdma *>(reinterpret_cast<uintptr_t>(ctrl_seg_ptr) + sizeof(*ctrl_seg_ptr));
+    auto data_seg_ptr = reinterpret_cast<struct bnxt_re_sge *>(reinterpret_cast<uintptr_t>(raddr_seg_ptr) + sizeof(*raddr_seg_ptr));
+    auto data_seg2_ptr = reinterpret_cast<struct bnxt_re_sge *>(reinterpret_cast<uintptr_t>(data_seg_ptr) + sizeof(*data_seg_ptr));
 
-    raddr_seg.raddr = HTOBE64(raddr);
-    raddr_seg.rkey = rkey;
-    raddr_seg.reserved = 0;
+    ctrl_seg = { 0 };
+    ctrl_seg.rsv_ws_fl_wt = HTOLE32((BNXT_RE_STATIC_WQE_SIZE_SLOTS << BNXT_RE_HDR_WS_SHIFT) |
+                                    (BNXT_RE_WR_FLAGS_SIGNALED << BNXT_RE_HDR_FLAGS_SHIFT) |
+                                    BNXT_RE_WR_OPCD_RDMA_WRITE);
+    ctrl_seg.key_immd = 0;
+    ctrl_seg.lhdr.qkey_len = HTOLE32(bytes);
 
-    data_seg.byte_count = HTOBE32(bytes);
-    data_seg.lkey = lkey;
-    data_seg.addr = HTOBE64(laddr);
+    raddr_seg.rva = HTOLE64(raddr);
+    raddr_seg.rkey = HTOBE32(rkey);
+    raddr_seg.ts = 0;
 
-    ctrl_seg = {
-        0,
-    };
-    ctrl_seg.qpn_ds = HTOBE32((qp->qpn << 8) | ds);
-    ctrl_seg.fm_ce_se = fm_ce_se;
-    ctrl_seg.opmod_idx_opcode = HTOBE32((wqe_idx << 8) | MLX5_OPCODE_RDMA_WRITE);
+    data_seg.length = HTOLE32(bytes);
+    data_seg.lkey = HTOBE32(lkey);
+    data_seg.pa = HTOLE64(laddr);
 
+    data_seg2 = { 0 };
+
+    // Calculate and fill start and end PSN of the WQE
+    //bnxt_re_fill_psns_for_msntbl(qp, bytes, wqe_idx);
     uint32_t *dst = (uint32_t *)ctrl_seg_ptr;
     uint32_t *src = (uint32_t *)&ctrl_seg;
     for (int i = 0; i < sizeof(*ctrl_seg_ptr) / sizeof(uint32_t); ++i)
         ibgda_store_relaxed(&dst[i], src[i]);
 
-    if (av_seg_size > 0) {
-        dst = (uint32_t *)av_seg_ptr;
-        src = (uint32_t *)dct;
-        for (int i = 0; i < av_seg_size / sizeof(uint32_t); ++i)
-            ibgda_store_relaxed(&dst[i], src[i]);
-    }
+#ifdef NVSHMEM_IBGDA_DEBUG
+    printf("slot 0: %08x %08x (ctrl_seg_ptr 0x%lx)\n", (dst[1]), (dst[0]),
+                    (unsigned long) ctrl_seg_ptr);
+    printf("      : %08x %08x\n", (dst[3]), (dst[2]));
+#endif
 
     dst = (uint32_t *)raddr_seg_ptr;
     src = (uint32_t *)&raddr_seg;
     for (int i = 0; i < sizeof(*raddr_seg_ptr) / sizeof(uint32_t); ++i)
         ibgda_store_relaxed(&dst[i], src[i]);
 
+#ifdef NVSHMEM_IBGDA_DEBUG
+    printf("slot 1: %08x %08x\n", (dst[1]), (dst[0]));
+    printf("      : %08x %08x\n", (dst[3]), (dst[2]));
+#endif
     dst = (uint32_t *)data_seg_ptr;
     src = (uint32_t *)&data_seg;
     for (int i = 0; i < sizeof(*data_seg_ptr) / sizeof(uint32_t); ++i)
+        ibgda_store_relaxed(&dst[i], src[i]);
+
+#ifdef NVSHMEM_IBGDA_DEBUG
+    printf("slot 2: %08x %08x\n", (dst[1]), (dst[0]));
+    printf("      : %08x %08x\n", (dst[3]), (dst[2]));
+#endif
+    dst = (uint32_t *)data_seg2_ptr;
+    src = (uint32_t *)&data_seg2;
+    for (int i = 0; i < sizeof(*data_seg2_ptr) / sizeof(uint32_t); ++i)
         ibgda_store_relaxed(&dst[i], src[i]);
 }
 
@@ -710,94 +769,86 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_w
     nvshmemi_ibgda_device_qp_t *qp, nvshmemi_ibgda_device_dct_t *dct, const void *val,
     uint64_t raddr, __be32 rkey, uint32_t bytes, uint16_t wqe_idx, uint8_t fm_ce_se,
     void **out_wqes) {
-    ibgda_ctrl_seg_t ctrl_seg;
-    struct mlx5_wqe_raddr_seg raddr_seg;
-    struct mlx5_wqe_inl_data_seg inl_seg;
+    ibgda_bnxt_ctrl_seg_t ctrl_seg;
+    struct bnxt_re_rdma raddr_seg;
+    struct bnxt_re_sge data_seg2;
 
-    ibgda_ctrl_seg_t *ctrl_seg_ptr = (ibgda_ctrl_seg_t *)out_wqes[0];
-    void *av_seg_ptr = (void *)((uintptr_t)ctrl_seg_ptr + sizeof(*ctrl_seg_ptr));
-    struct mlx5_wqe_raddr_seg *raddr_seg_ptr;
-    struct mlx5_wqe_inl_data_seg *inl_seg_ptr;
-    void *wqe_data_ptr;
-
-    size_t av_seg_size;
-    int ds;
+    ibgda_bnxt_ctrl_seg_t *ctrl_seg_ptr = (ibgda_bnxt_ctrl_seg_t *)out_wqes[0];
+    auto raddr_seg_ptr = reinterpret_cast<struct bnxt_re_rdma *>(reinterpret_cast<uintptr_t>(ctrl_seg_ptr) + sizeof(*ctrl_seg_ptr));
+    auto wqe_data_seg_ptr = reinterpret_cast<struct bnxt_re_sge *>(reinterpret_cast<uintptr_t>(raddr_seg_ptr) + sizeof(*raddr_seg_ptr));
+    auto data_seg2_ptr = reinterpret_cast<struct bnxt_re_sge *>(reinterpret_cast<uintptr_t>(wqe_data_seg_ptr) + sizeof(*wqe_data_seg_ptr));
 
     // Allow up to 12 bytes
     assert(likely(bytes <= 12));
 
-    if (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) {
-        if (support_half_av_seg) {
-            ds = 4;
-            av_seg_size = sizeof(ibgda_half_av_seg_t);
-            raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)((uintptr_t)av_seg_ptr + av_seg_size);
-        } else {
-            ds = 6;
-            av_seg_size = sizeof(struct mlx5_wqe_av);
-            raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)out_wqes[1];
-        }
-    } else {
-        ds = 3;
-        av_seg_size = 0;
-        raddr_seg_ptr = (struct mlx5_wqe_raddr_seg *)av_seg_ptr;
-    }
-    inl_seg_ptr =
-        (struct mlx5_wqe_inl_data_seg *)((uintptr_t)raddr_seg_ptr + sizeof(*raddr_seg_ptr));
-    wqe_data_ptr = (void *)((uintptr_t)inl_seg_ptr + sizeof(*inl_seg_ptr));
+    ctrl_seg = { 0 };
+    ctrl_seg.rsv_ws_fl_wt = HTOLE32((BNXT_RE_STATIC_WQE_SIZE_SLOTS << BNXT_RE_HDR_WS_SHIFT) |
+                                (BNXT_RE_WR_FLAGS_SIGNALED << BNXT_RE_HDR_FLAGS_SHIFT) |
+                                (BNXT_RE_WR_FLAGS_INLINE << BNXT_RE_HDR_FLAGS_SHIFT) |
+                                BNXT_RE_WR_OPCD_RDMA_WRITE);
+    ctrl_seg.key_immd = HTOLE32(*(uint32_t *)val);
+    ctrl_seg.lhdr.qkey_len = 32;
 
-    raddr_seg.raddr = HTOBE64(raddr);
-    raddr_seg.rkey = rkey;
-    raddr_seg.reserved = 0;
+    // Calculate and fill start and end PSN of the WQE
+    //bnxt_re_fill_psns_for_msntbl(qp, bytes, wqe_idx);
 
-    inl_seg.byte_count = HTOBE32(bytes | MLX5_INLINE_SEG);
-
-    ctrl_seg = {
-        0,
-    };
-    ctrl_seg.qpn_ds = HTOBE32((qp->qpn << 8) | ds);
-    ctrl_seg.fm_ce_se = fm_ce_se;
-    ctrl_seg.opmod_idx_opcode = HTOBE32((wqe_idx << 8) | MLX5_OPCODE_RDMA_WRITE);
+    raddr_seg.rva = HTOLE64(raddr);
+    raddr_seg.rkey = HTOBE32(rkey);
+    raddr_seg.ts = 0;
 
     uint32_t *dst = (uint32_t *)ctrl_seg_ptr;
     uint32_t *src = (uint32_t *)&ctrl_seg;
     for (int i = 0; i < sizeof(*ctrl_seg_ptr) / sizeof(uint32_t); ++i)
         ibgda_store_relaxed(&dst[i], src[i]);
 
-    if (av_seg_size > 0) {
-        dst = (uint32_t *)av_seg_ptr;
-        src = (uint32_t *)dct;
-        for (int i = 0; i < av_seg_size / sizeof(uint32_t); ++i)
-            ibgda_store_relaxed(&dst[i], src[i]);
-    }
+#ifdef NVSHMEM_IBGDA_DEBUG
+    printf("slot 0: %08x %08x (ctrl_seg_ptr 0x%lx) bytes %d\n",
+            (dst[1]), (dst[0]),
+            (unsigned long) ctrl_seg_ptr, bytes);
+    printf("      : %08x %08x\n", (dst[3]), (dst[2]));
+#endif
 
     dst = (uint32_t *)raddr_seg_ptr;
     src = (uint32_t *)&raddr_seg;
     for (int i = 0; i < sizeof(*raddr_seg_ptr) / sizeof(uint32_t); ++i)
         ibgda_store_relaxed(&dst[i], src[i]);
-
-    dst = (uint32_t *)inl_seg_ptr;
-    src = (uint32_t *)&inl_seg;
-    for (int i = 0; i < sizeof(*inl_seg_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
+#ifdef NVSHMEM_IBGDA_DEBUG
+    printf("slot 1: %08x %08x\n", (dst[1]), (dst[0]));
+    printf("      : %08x %08x\n", (dst[3]), (dst[2]));
+#endif
 
     switch (bytes) {
         case 1:
-            ibgda_store_relaxed((uint8_t *)wqe_data_ptr, *((uint8_t *)val));
+            ibgda_store_relaxed((uint8_t *)wqe_data_seg_ptr, *((uint8_t *)val));
             break;
         case 2:
-            ibgda_store_relaxed((uint16_t *)wqe_data_ptr, *((uint16_t *)val));
+            ibgda_store_relaxed((uint16_t *)wqe_data_seg_ptr, *((uint16_t *)val));
             break;
         case 4:
-            ibgda_store_relaxed((uint32_t *)wqe_data_ptr, *((uint32_t *)val));
+            ibgda_store_relaxed((uint32_t *)wqe_data_seg_ptr, *((uint32_t *)val));
             break;
         case 8:
             // wqe_data_ptr is aligned at 4B. We cannot use uint64_t here.
-            ibgda_store_relaxed(&(((uint32_t *)wqe_data_ptr)[0]), ((uint32_t *)val)[0]);
-            ibgda_store_relaxed(&(((uint32_t *)wqe_data_ptr)[1]), ((uint32_t *)val)[1]);
+            ibgda_store_relaxed(&(((uint32_t *)wqe_data_seg_ptr)[0]),
+                            ((uint32_t *)val)[0] + 1);
+            ibgda_store_relaxed(&(((uint32_t *)wqe_data_seg_ptr)[1]),
+                            ((uint32_t *)val)[1]);
             break;
         default:
-            memcpy(wqe_data_ptr, val, bytes);
+            memcpy(wqe_data_seg_ptr, val, bytes);
     }
+
+#ifdef NVSHMEM_IBGDA_DEBUG
+    dst = (uint32_t *)wqe_data_seg_ptr;
+    printf("slot 2: %08x %08x\n", (dst[1]), (dst[0]));
+    printf("      : %08x %08x\n", (dst[3]), (dst[2]));
+#endif
+
+    data_seg2 = { 0 };
+    dst = (uint32_t *)data_seg2_ptr;
+    src = (uint32_t *)&data_seg2;
+    for (int i = 0; i < sizeof(*data_seg2_ptr) / sizeof(uint32_t); ++i)
+        ibgda_store_relaxed(&dst[i], src[i]);
 }
 
 /**
@@ -1567,37 +1618,36 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_atomic
         ibgda_store_relaxed(&dst[i], src[i]);
 }
 
-__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_update_dbr(
-    nvshmemi_ibgda_device_qp_t *qp, uint32_t dbrec_head) {
-    // DBREC contains the index of the next empty WQEBB.
-    __be32 dbrec_val;
-    __be32 *dbrec_ptr = qp->tx_wq.dbrec;
+__device__ void bnxt_re_init_db_hdr(struct bnxt_re_db_hdr *hdr,
+       uint32_t indx, uint32_t toggle,
+       uint32_t qid, uint32_t typ) {
+   uint64_t key_lo, key_hi;
 
-    // This is equivalent to
-    // WRITE_ONCE(dbrec_ptr, HTOBE32(dbrec_head & 0xffff));
-    asm volatile(
-        "{\n\t"
-        ".reg .b32 mask1;\n\t"
-        ".reg .b32 dbrec_head_16b;\n\t"
-        ".reg .b32 ign;\n\t"
-        ".reg .b32 mask2;\n\t"
-        "mov.b32 mask1, 0xffff;\n\t"
-        "mov.b32 mask2, 0x123;\n\t"
-        "and.b32 dbrec_head_16b, %1, mask1;\n\t"
-        "prmt.b32 %0, dbrec_head_16b, ign, mask2;\n\t"
-        "}"
-        : "=r"(dbrec_val)
-        : "r"(dbrec_head));
-    ibgda_store_release(dbrec_ptr, dbrec_val);
+   key_lo = HTOLE32(indx | toggle);
+   key_hi = HTOLE32((qid & BNXT_RE_DB_QID_MASK) |
+            ((typ & BNXT_RE_DB_TYP_MASK) << BNXT_RE_DB_TYP_SHIFT) |
+            (0x1UL << BNXT_RE_DB_VALID_SHIFT));
+   hdr->typ_qid_indx = HTOLE32((key_lo | (key_hi << 32)));
 }
 
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_ring_db(
     nvshmemi_ibgda_device_qp_t *qp, uint16_t prod_idx) {
     uint64_t *bf_ptr = (uint64_t *)qp->tx_wq.bf;
-    ibgda_ctrl_seg_t ctrl_seg = {.opmod_idx_opcode = HTOBE32(prod_idx << 8),
-                                 .qpn_ds = HTOBE32(qp->qpn << 8)};
+    struct bnxt_re_db_hdr hdr;
+    // Won't wrap in the middle of a WQE
+    uint32_t last_slot_idx = prod_idx << BNXT_RE_STATIC_WQE_SHIFT + BNXT_RE_STATIC_WQE_SIZE_SLOTS - 1;
 
-    ibgda_store_release(bf_ptr, *((uint64_t *)&ctrl_seg));
+    // Convert WQE idx to slot idx
+    bnxt_re_init_db_hdr(&hdr, prod_idx * BNXT_RE_STATIC_WQE_SIZE_SLOTS, 0,
+                    qp->qpn, BNXT_RE_QUE_TYPE_SQ);
+
+#ifdef NVSHMEM_IBGDA_DEBUG
+    printf("From %s %d qpn 0x%x last %#x %#x at 0x%lx 0x%x 0x%lx\n",
+                    __func__, __LINE__, qp->qpn, last_slot_idx, prod_idx,
+                    (unsigned long)bf_ptr, qp->tx_wq.nwqes, (unsigned long)qp->tx_wq.cq);
+#endif
+    // Write to the actual DB
+    ibgda_store_release(bf_ptr, *((uint64_t *)&hdr));
 }
 
 template <bool need_strong_flush>
@@ -1617,8 +1667,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_post_send(
                                        (unsigned long long int)new_prod_idx);
 
     if (likely(new_prod_idx > old_prod_idx)) {
-        IBGDA_MEMBAR();
-        ibgda_update_dbr(qp, new_prod_idx);
         IBGDA_MEMBAR();
         ibgda_ring_db(qp, new_prod_idx);
     }
@@ -1689,7 +1737,10 @@ ibgda_quiet(nvshmemi_ibgda_device_qp_t *qp) {
     // TODO: Integrate the error handler with the core NVSHMEM
 #ifdef NVSHMEM_IBGDA_DEBUG
     if (status) {
-        printf("ibgda_poll_cq failed with error=%d.\n", err);
+        printf("ibgda_poll_cq failed with error=%d. (%d 0x%lx 0x%lx 0x%lx)\n", err,
+                    state->use_async_postsend, prod_idx,
+                ibgda_atomic_read(qp->tx_wq.prod_idx),
+                    ibgda_atomic_read(&qp->mvars.tx_wq.ready_head));
     }
 #endif
     assert(likely(status == 0));

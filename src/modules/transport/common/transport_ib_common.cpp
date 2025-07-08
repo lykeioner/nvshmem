@@ -107,6 +107,12 @@ int nvshmemt_ib_common_reg_mem_handle(struct nvshmemt_ibv_function_table *ftable
     handle->mr = mr;
     handle->local_only = local_only;
 
+    INFO(log_level, "ibv_reg_mr pdn %d handle %p handle->mr %p "
+                    "key 0x%llx 0x%llx buf 0x%llx len 0x%x",
+                    pd->handle, handle, handle->mr,
+                    handle->lkey, handle->rkey,
+                    handle->buf, length);
+
 out:
     return status;
 }

@@ -105,7 +105,7 @@ enum bnxt_re_dv_obj_type {
 int bnxt_re_dv_modify_qp_udp_sport(struct ibv_qp *qp, uint16_t udp_sport);
 
 struct bnxt_re_dv_db_region_attr {
-	uint32_t dbr_handle;
+	uint32_t handle;
 	uint32_t dpi;
 	uint64_t umdbr;
 	__u64 *dbr;
@@ -141,6 +141,11 @@ struct bnxt_re_dv_cq_init_attr {
 	uint32_t ncqe;
 };
 
+struct bnxt_re_dv_cq_attr {
+	uint32_t ncqe; /* no. of entries */
+	uint32_t cqe_size; /* size of entries */
+};
+
 struct bnxt_re_dv_qp_init_attr {
 	/* Standard ibv params */
 	enum ibv_qp_type qp_type;
@@ -155,7 +160,7 @@ struct bnxt_re_dv_qp_init_attr {
 
 	/* DV params */
 	uint64_t qp_handle;	/* to match with cqe */
-	uint32_t dbr_handle;	/* dbr_handle from alloc_dbr */
+	void *dbr_handle;	/* dbr_handle from alloc_dbr */
 	void *sq_umem_handle;	/* umem_handle from umem_reg */
 	uint64_t sq_umem_offset;	/* offset into umem */
 	uint32_t sq_len;	/* sq length including MSN area */
@@ -204,6 +209,8 @@ int bnxt_re_dv_qp_mem_alloc(struct ibv_pd *ibvpd,
 int bnxt_re_dv_qp_get_mem_info(struct ibv_pd *ibvpd,
 			       struct ibv_qp_init_attr *attr,
 			       struct bnxt_re_dv_qp_mem_info *qp_mem);
+int bnxt_re_dv_get_cq_attr(struct ibv_context *ibvctx, uint32_t ncqe,
+			   struct bnxt_re_dv_cq_attr *cq_attr);
 #ifdef __cplusplus
 }
 #endif

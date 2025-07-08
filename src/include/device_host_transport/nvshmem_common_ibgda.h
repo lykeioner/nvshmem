@@ -151,6 +151,8 @@ typedef struct {
     uint32_t cqn;
     uint32_t ncqes;
     uint32_t qpn;
+    /* Validity of the CQE, change phase whenever cons_idx crosses 0 */
+    uint32_t phase;
 } nvshmemi_ibgda_device_cq_v1;
 static_assert(sizeof(nvshmemi_ibgda_device_cq_v1) == 72, "ibgda_device_cq_v1 must be 72 bytes.");
 
@@ -215,9 +217,18 @@ typedef struct nvshmemi_ibgda_device_qp {
         // May point to mvars.prod_idx or internal prod_idx
         uint64_t *prod_idx;
     } rx_wq;
+
+    /* MSN table related parameters */
+    uint16_t mtu;
+    uint32_t sq_psn;
+    uint32_t msn;
+    uint32_t msn_tbl_sz;
+    uint32_t *dbtail;
+    void *pad;
+
     nvshmemi_ibgda_device_qp_management_v1 mvars;  // management variables
 } nvshmemi_ibgda_device_qp_v1;
-static_assert(sizeof(nvshmemi_ibgda_device_qp_v1) == 256, "ibgda_device_qp_v1 must be 256 bytes.");
+static_assert(sizeof(nvshmemi_ibgda_device_qp_v1) == 288, "ibgda_device_qp_v1 must be 288 bytes.");
 
 typedef nvshmemi_ibgda_device_qp_v1 nvshmemi_ibgda_device_qp_t;
 
