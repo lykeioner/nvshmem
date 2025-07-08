@@ -631,7 +631,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_dump_w
         ibgda_store_relaxed(&dst[i], src[i]);
 }
 
-#if 0
 // These MSN table routines need to change to cp the entire 64b into the GPU memory instead
 __device__ void *bnxt_re_pull_psn_buff(nvshmemi_ibgda_device_qp_t *qp) {
    // MSN entries are 64b wide << 4
@@ -653,13 +652,13 @@ __device__ void bnxt_re_fill_psns_for_msntbl(nvshmemi_ibgda_device_qp_t *qp, uin
                                             uint16_t wqe_idx) {
    uint32_t npsn = 0, start_psn = 0, next_psn = 0;
    struct bnxt_re_msns msns;
-   struct bnxt_re_msns *msns_ptr;
+   uint64_t *msns_ptr;
    uint32_t pkt_cnt = 0;
    /* Start slot index of the WQE */
    uint32_t st_idx = wqe_idx * BNXT_RE_STATIC_WQE_SIZE_SLOTS;
 
    // Get the MSN table address
-   msns_ptr = (struct bnxt_re_msns *)bnxt_re_pull_psn_buff(qp);
+   msns_ptr = (uint64_t *)bnxt_re_pull_psn_buff(qp);
 
    // Start PSN is the last recorded PSN
    // Calculate the packet count based on the len of the WQE/MTU
@@ -685,12 +684,9 @@ __device__ void bnxt_re_fill_psns_for_msntbl(nvshmemi_ibgda_device_qp_t *qp, uin
        qp->msn++;
        qp->msn %= qp->msn_tbl_sz;
    }
-   uint32_t *dst = (uint32_t *)msns_ptr;
-   uint32_t *src = (uint32_t *)&msns;
-   for (int i = 0; i < sizeof(*msns_ptr) / sizeof(uint32_t); ++i)
-       ibgda_store_release(&dst[i], *(uint64_t *)(&src[i]));
+
+   ibgda_store_release(msns_ptr, *((uint64_t *)&msns));
 }
-#endif
 
 template <bool support_half_av_seg>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_write_wqe(
@@ -728,7 +724,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_w
     data_seg2 = { 0 };
 
     // Calculate and fill start and end PSN of the WQE
-    //bnxt_re_fill_psns_for_msntbl(qp, bytes, wqe_idx);
+    bnxt_re_fill_psns_for_msntbl(qp, bytes, wqe_idx);
     uint32_t *dst = (uint32_t *)ctrl_seg_ptr;
     uint32_t *src = (uint32_t *)&ctrl_seg;
     for (int i = 0; i < sizeof(*ctrl_seg_ptr) / sizeof(uint32_t); ++i)
@@ -790,7 +786,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_w
     ctrl_seg.lhdr.qkey_len = 32;
 
     // Calculate and fill start and end PSN of the WQE
-    //bnxt_re_fill_psns_for_msntbl(qp, bytes, wqe_idx);
+    bnxt_re_fill_psns_for_msntbl(qp, bytes, wqe_idx);
 
     raddr_seg.rva = HTOLE64(raddr);
     raddr_seg.rkey = HTOBE32(rkey);

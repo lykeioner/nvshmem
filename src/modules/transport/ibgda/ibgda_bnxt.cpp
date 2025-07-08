@@ -1682,7 +1682,7 @@ static int ibgda_create_qp_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
     wq_mobject->qp_mem.qp_handle = 0;
     wq_mobject->qp_mem.sq_len = wq_buf_size_per_qp;
     wq_mobject->qp_mem.sq_slots = nslots;
-    wq_mobject->qp_mem.sq_wqe_sz = 0xf0; /* Max sq wqe size based on 15 sges */
+    wq_mobject->qp_mem.sq_wqe_sz = 0x40; /* Max sq wqe size based on 4 sges */
     wq_mobject->qp_mem.sq_psn_sz = 0x8;
     wq_mobject->qp_mem.sq_npsn = psn_nslots;
 
@@ -2139,8 +2139,8 @@ static void ibgda_get_device_qp(nvshmemi_ibgda_device_qp_t *dev_qp, struct ibgda
     dev_qp->msn_tbl_sz = ep->msn_tbl_sz;
     // First MSN tbl entry GPU VA
     dev_qp->pad = (void *)((uintptr_t)dev_qp->tx_wq.wqe +
-                           (dev_qp->tx_wq.nwqes * BNXT_RE_STATIC_WQE_BB *
-                            BNXT_RE_STATIC_WQE_SIZE_SLOTS));
+			    (dev_qp->tx_wq.nwqes * BNXT_RE_STATIC_WQE_SIZE_SLOTS *
+			    BNXT_RE_SLOT_SIZE_BB));
 
     ibgda_get_device_qp_mvars(&dev_qp->mvars, device, ep);
 }
