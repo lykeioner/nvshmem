@@ -411,8 +411,8 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_check_poll_ti
             ibgda_atomic_read(cq->prod_idx), cq->cqn, cq->qpn,
             ibgda_atomic_read(cq->resv_head),
             ibgda_atomic_read(cq->ready_head), idx);
-        status = -1;
         */
+        status = -1;
     }
     return status;
 }
