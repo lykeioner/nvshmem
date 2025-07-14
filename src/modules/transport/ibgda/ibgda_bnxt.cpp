@@ -35,7 +35,7 @@
 #include "internal/host_transport/transport.h"  // for nvshmem_transport, nvshmem_...
 #include "transport_common.h"                   // for nvshmemt_ibv_function_table
 #include "transport_ib_common.h"                // for nvshmemt_ib_common_mem_handle
-#include "bnxt_re_dv.h"
+#include "infiniband/bnxt_re_dv.h"
 #ifdef NVSHMEM_USE_GDRCOPY
 #include "transport_gdr_common.h"
 #endif
@@ -1168,19 +1168,19 @@ static int ibgda_qp_rst2init(struct ibgda_ep *ep, const struct ibgda_device *dev
     struct ibv_qp* ib_qp = ep->devx_qp;
     struct ibv_qp_attr ib_qp_attr;
     struct ib_uverbs_qp_attr ib_qp_uattr;
-    int status = 0;
+    int status = 0, flags;
 
     // RST2INIT
     memset(&ib_qp_attr, 0, sizeof(ib_qp_attr));
-    ib_qp_uattr.qp_state = IBV_QPS_INIT;
-    ib_qp_uattr.pkey_index = 0;
-    ib_qp_uattr.port_num = portid;
-    ib_qp_uattr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
+    ib_qp_attr.qp_state = IBV_QPS_INIT;
+    ib_qp_attr.pkey_index = 0;
+    ib_qp_attr.port_num = portid;
+    ib_qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
                                   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
-    ib_qp_uattr.qp_attr_mask = (IBV_QP_STATE | IBV_QP_PKEY_INDEX |
-                                IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+    flags = (IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+             IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
 
-    status = bnxt_re_dv_modify_qp(ib_qp, &ib_qp_uattr, 0, 0);
+    status = bnxt_re_dv_modify_qp(ib_qp, &ib_qp_attr, flags, 0, 0);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
                          "bnxt_re_dv_modify_qp rst2init for dci failed.\n");
     ep->portid = portid;
@@ -1199,11 +1199,8 @@ static int ibgda_dci_init2rtr(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_
 static int ibgda_rc_init2rtr(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_ep *ep,
                              const struct ibgda_device *device, int portid,
                              struct ibgda_rc_handle *peer_ep_handle) {
-    int status = 0;
-    struct ib_uverbs_qp_attr ib_qp_uattr = {};
-    struct ibv_qp_attr attr = {};
-    int flags;
-    __u8 *gid_raw;
+    struct ibv_qp_attr ib_qp_attr = {};
+    int status = 0, flags;
 
     const struct ibv_port_attr *port_attr = device->port_attr + (portid - 1);
 
@@ -1219,100 +1216,58 @@ static int ibgda_rc_init2rtr(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_e
         ftable.query_gid(device->context, portid, device->gid_info[portid - 1].local_gid_index,
                          (ibv_gid *)&device->gid_info[portid - 1].local_gid);
 
-        ib_qp_uattr.alt_ah_attr.is_global = 0;
+        ib_qp_attr.alt_ah_attr.is_global = 0;
 
-        ib_qp_uattr.qp_state = IBV_QPS_RTR;
-        ib_qp_uattr.path_mtu = port_attr->active_mtu;
-        ib_qp_uattr.min_rnr_timer = 12;
-        ib_qp_uattr.dest_qp_num = peer_ep_handle->qpn;
-        ib_qp_uattr.rq_psn = 0;
+        ib_qp_attr.qp_state = IBV_QPS_RTR;
+        ib_qp_attr.path_mtu = port_attr->active_mtu;
+        ib_qp_attr.min_rnr_timer = 12;
+        ib_qp_attr.dest_qp_num = peer_ep_handle->qpn;
+        ib_qp_attr.rq_psn = 0;
         //ib_qp_uattr.max_dest_rd_atomic = NVSHMEMT_IBRC_MAX_RD_ATOMIC;
-        ib_qp_uattr.max_dest_rd_atomic = 126;
-        ib_qp_uattr.ah_attr.sl = ibgda_state->options->IB_SL;
-        ib_qp_uattr.ah_attr.src_path_bits = 0;
-        ib_qp_uattr.ah_attr.port_num = portid;
+        ib_qp_attr.max_dest_rd_atomic = 126;
+        ib_qp_attr.ah_attr.sl = ibgda_state->options->IB_SL;
+        ib_qp_attr.ah_attr.src_path_bits = 0;
+        ib_qp_attr.ah_attr.port_num = portid;
         /* TBD - ROCEV2 only */
-        ib_qp_uattr.ah_attr.dlid = port_attr->lid | (IBGDA_ROCE_V2_UDP_SPORT_BASE);
-        ib_qp_uattr.ah_attr.is_global = 1;
-        //ib_qp_uattr.ah_attr.grh.dgid.global.subnet_prefix = peer_ep_handle->spn;
-        //ib_qp_uattr.ah_attr.grh.dgid.global.interface_id = peer_ep_handle->iid;
-        gid_raw = ib_qp_uattr.ah_attr.grh.dgid;
-        memcpy(gid_raw, &peer_ep_handle->spn, 8);
-        gid_raw = gid_raw + 8;
-        memcpy(gid_raw, &peer_ep_handle->iid, 8);
-
-
-        ib_qp_uattr.ah_attr.grh.sgid_index = device->gid_info[portid - 1].local_gid_index;
-        ib_qp_uattr.ah_attr.grh.traffic_class = ibgda_state->options->IB_TRAFFIC_CLASS;
-
-        ib_qp_uattr.pkey_index = 0;
-        ib_qp_uattr.port_num = portid;
-        ib_qp_uattr.qp_attr_mask = (IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
-                                    IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MIN_RNR_TIMER |
-                                    IBV_QP_MAX_DEST_RD_ATOMIC);
-
-
-
-
-
-        attr.alt_ah_attr.is_global = 0;
-        attr.qp_state = IBV_QPS_RTR;
-        attr.path_mtu = port_attr->active_mtu;
-        attr.min_rnr_timer = 12;
-        attr.dest_qp_num = peer_ep_handle->qpn;
-        attr.rq_psn = 0;
-        //ib_qp_uattr.max_dest_rd_atomic = NVSHMEMT_IBRC_MAX_RD_ATOMIC;
-        attr.max_dest_rd_atomic = 126;
-        attr.ah_attr.sl = ibgda_state->options->IB_SL;
-        attr.ah_attr.src_path_bits = 0;
-        attr.ah_attr.port_num = portid;
-        /* TBD - ROCEV2 only */
-        attr.ah_attr.dlid = port_attr->lid | (IBGDA_ROCE_V2_UDP_SPORT_BASE);
-        attr.ah_attr.is_global = 1;
-        attr.ah_attr.grh.dgid.global.subnet_prefix = peer_ep_handle->spn;
-        attr.ah_attr.grh.dgid.global.interface_id = peer_ep_handle->iid;
-        attr.ah_attr.grh.sgid_index = device->gid_info[portid - 1].local_gid_index;
-        attr.ah_attr.grh.traffic_class = ibgda_state->options->IB_TRAFFIC_CLASS;
-
-        attr.pkey_index = 0;
-        attr.port_num = portid;
-        flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
-                IBV_QP_MIN_RNR_TIMER | IBV_QP_MAX_DEST_RD_ATOMIC;
-
-        //status = ftable.modify_qp(ep->devx_qp, &attr, flags);
-        //NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "GPU1 ibv_modify_qp failed \n");
+        ib_qp_attr.ah_attr.dlid = port_attr->lid | (IBGDA_ROCE_V2_UDP_SPORT_BASE);
+        ib_qp_attr.ah_attr.is_global = 1;
+        ib_qp_attr.ah_attr.grh.dgid.global.subnet_prefix = peer_ep_handle->spn;
+        ib_qp_attr.ah_attr.grh.dgid.global.interface_id = peer_ep_handle->iid;
+        ib_qp_attr.ah_attr.grh.sgid_index = device->gid_info[portid - 1].local_gid_index;
+        flags = (IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                 IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MIN_RNR_TIMER |
+                 IBV_QP_MAX_DEST_RD_ATOMIC);
     }
 
     /* MSN Table */
     ep->mtu = port_attr->active_mtu;
-    status = bnxt_re_dv_modify_qp(ep->devx_qp, &ib_qp_uattr, 0, 0);
+    status = bnxt_re_dv_modify_qp(ep->devx_qp, &ib_qp_attr, flags, 0, 0);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-                          "GPU1 Error in bnxt_re_dv_modify_qp for INIT2RTR_QP peer qpn %d \n", ep->qpn);
+                          "Error in bnxt_re_dv_modify_qp for INIT2RTR_QP peer qpn %d \n", ep->qpn);
 
-    NVSHMEMI_WARN_PRINT("IBGDA_BNXT: from %s %d \n", __func__, __LINE__);
 out:
     return status;
 }
 
 static int ibgda_qp_rtr2rts(struct ibgda_ep *ep, const struct ibgda_device *device, int portid) {
-    int status = 0;
-    struct ib_uverbs_qp_attr ib_qp_uattr = {};
+    int status = 0, flags;
+    struct ibv_qp_attr ib_qp_attr = {};
 
-    memset(&ib_qp_uattr, 0, sizeof(struct ib_uverbs_qp_attr));
-    ib_qp_uattr.qp_state = IBV_QPS_RTS;
-    ib_qp_uattr.sq_psn = 0;
-    ib_qp_uattr.timeout = 20;
-    ib_qp_uattr.retry_cnt = 7;
-    ib_qp_uattr.rnr_retry = 7;
-    ib_qp_uattr.max_rd_atomic = 7;
+    memset(&ib_qp_attr, 0, sizeof(struct ibv_qp_attr));
+    ib_qp_attr.qp_state = IBV_QPS_RTS;
+    ib_qp_attr.sq_psn = 0;
+    ib_qp_attr.timeout = 20;
+    ib_qp_attr.retry_cnt = 7;
+    ib_qp_attr.rnr_retry = 7;
+    ib_qp_attr.max_rd_atomic = 7;
 
-    ib_qp_uattr.qp_attr_mask = (IBV_QP_STATE | IBV_QP_SQ_PSN |
+    flags = (IBV_QP_STATE | IBV_QP_SQ_PSN |
                                 IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                                 IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC);
 
-    status = bnxt_re_dv_modify_qp(ep->devx_qp, &ib_qp_uattr, 0, 0);
+    status = bnxt_re_dv_modify_qp(ep->devx_qp, &ib_qp_attr, flags, 0, 0);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-                          "GPU1 Error in bnxt_re_dv_modify_qp for RTR2RTS_QP peer qpn %d \n", ep->qpn);
+                          "Error in bnxt_re_dv_modify_qp for RTR2RTS_QP peer qpn %d \n", ep->qpn);
 
     NVSHMEMI_WARN_PRINT("IBGDA_BNXT: from %s %d \n", __func__, __LINE__);
 out:
@@ -1789,7 +1744,7 @@ static int ibgda_alloc_and_map_qp_uar(struct ibv_context *context, ibgda_nic_han
 
     if (bnxt_re_dv_get_default_db_region(context, &attr)) {
         NVSHMEMI_WARN_PRINT(
-            "GPU1: bnxt_re_dv_get_default_dbr failed.\n");
+            "bnxt_re_dv_get_default_dbr failed.\n");
         status = NVSHMEMX_ERROR_INTERNAL;
         goto out;
     }
@@ -2139,8 +2094,8 @@ static void ibgda_get_device_qp(nvshmemi_ibgda_device_qp_t *dev_qp, struct ibgda
     dev_qp->msn_tbl_sz = ep->msn_tbl_sz;
     // First MSN tbl entry GPU VA
     dev_qp->pad = (void *)((uintptr_t)dev_qp->tx_wq.wqe +
-			    (dev_qp->tx_wq.nwqes * BNXT_RE_STATIC_WQE_SIZE_SLOTS *
-			    BNXT_RE_SLOT_SIZE_BB));
+                            (dev_qp->tx_wq.nwqes * BNXT_RE_STATIC_WQE_SIZE_SLOTS *
+                            BNXT_RE_SLOT_SIZE_BB));
 
     ibgda_get_device_qp_mvars(&dev_qp->mvars, device, ep);
 }
@@ -2653,18 +2608,19 @@ int nvshmemt_ibgda_connect_endpoints(nvshmem_transport_t t, int *selected_dev_id
             struct ibv_qp* ib_qp = device->dci.eps[i]->devx_qp;
             struct ibv_qp_attr ib_qp_attr;
             struct ib_uverbs_qp_attr ib_qp_uattr;
+            int flags;
 
             // RST2INIT
             memset(&ib_qp_attr, 0, sizeof(ib_qp_attr));
-            ib_qp_uattr.qp_state = IBV_QPS_INIT;
-            ib_qp_uattr.pkey_index = 0;
-            ib_qp_uattr.port_num = portid;
-            ib_qp_uattr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
+            ib_qp_attr.qp_state = IBV_QPS_INIT;
+            ib_qp_attr.pkey_index = 0;
+            ib_qp_attr.port_num = portid;
+            ib_qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
                                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
-            ib_qp_uattr.qp_attr_mask = (IBV_QP_STATE | IBV_QP_PKEY_INDEX |
-                                        IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+            flags = (IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+                     IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
 
-            status = bnxt_re_dv_modify_qp(ib_qp, &ib_qp_uattr, 0, 0);
+            status = bnxt_re_dv_modify_qp(ib_qp, &ib_qp_attr, flags, 0, 0);
             NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
                                   "bnxt_re_dv_modify_qp rst2init for dci failed.\n");
         }
