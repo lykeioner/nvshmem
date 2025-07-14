@@ -437,14 +437,13 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
     uint64_t start = ibgda_query_globaltimer();
     uint64_t now;
 #endif
+    uint64_t hwcqe_cons_idx = 0;
     bnxt_re_bcqe *hdr;
     uint32_t flg_val;
     struct bnxt_re_req_cqe *hwcqe = (struct bnxt_re_req_cqe *)cq->cqe;
 
     auto cons_idx = ibgda_atomic_read(cq->cons_idx);
     auto prod_idx = ibgda_atomic_read(cq->prod_idx);
-    auto resv_head = ibgda_atomic_read(cq->resv_head);
-    auto ready_head = ibgda_atomic_read(cq->ready_head);
     bool valid_comp = false;
     uint8_t cqe_status = 0;
 
@@ -457,8 +456,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
     do {
         cons_idx = ibgda_atomic_read(cq->cons_idx);
         prod_idx = ibgda_atomic_read(cq->prod_idx);
-        resv_head = ibgda_atomic_read(cq->resv_head);
-        ready_head = ibgda_atomic_read(cq->ready_head);
 
         hwcqe = (struct bnxt_re_req_cqe *)((unsigned long)cq->cqe +
                  (cons_idx * bnxt_re_get_cqe_sz()));
@@ -476,7 +473,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
                  (cqe_slot[3]), (cqe_slot[2]), cq->cqn, cons_idx + i);
             cqe_slot = cqe_slot + 4;
         }
-        printf("qpn %d cqn %d flg_val %08x  ready_head 0x%lx resv_head 0x%lx"
+        printf("qpn %d cqn %d flg_val %08x  ready_head 0x%lx resv_head 0x%lx "
             "idx from caller 0x%lx tx prod 0x%lx tx cons 0x%lx (hw sq_cons 0x%x) phase 0x%x\n",
             cq->qpn, cq->cqn, flg_val, ibgda_atomic_read(cq->resv_head),
             ibgda_atomic_read(cq->ready_head), idx,
@@ -493,6 +490,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
             valid_comp = true;
             // cq->cons_idx is local tracking of consumer of CQ.
             *cq->cons_idx = cons_idx;
+            hwcqe_cons_idx = hwcqe->con_indx;
             if (!cqe_status)
                 goto check_opcode;
         }
@@ -505,7 +503,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
         // TBD - We need proper handling here.
         // Poll might be called for those CQs as well, which has never
         // done any posting.
-    } while (resv_head != ready_head);
+    } while (idx > hwcqe_cons_idx);
 
     // Prevent reordering of the opcode wait above
     IBGDA_MFENCE();
