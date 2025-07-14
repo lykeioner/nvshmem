@@ -431,7 +431,6 @@ static_assert(NVSHMEMI_IBGDA_MAX_QP_DEPTH <= 32768,
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
     nvshmemi_ibgda_device_cq_t *cq, uint64_t idx, int *error) {
     int status = 0;
-    struct bnxt_re_req_cqe *cqe64_bnxt = (struct bnxt_re_req_cqe *)cq->cqe;
 
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
     uint64_t start = ibgda_query_globaltimer();
@@ -528,12 +527,22 @@ check_opcode:
         "[%d] ibgda_poll_cq %s: \n"
         "    cons_idx=%#lx, prod_idx=%#lx, cqn=%#x, qpn=%#x \n"
         "    resv_head=%#lx, ready_head=%#lx\n"
-        "    while waiting for idx=%#lx. handle=0x%llx cqe_status 0x%x\n",
-        nvshmemi_device_state_d.mype, valid_comp ? "SUCESS" : "TIMEOUT",
+        "    while waiting for idx=%#lx. cqe_status 0x%x\n",
+        nvshmemi_device_state_d.mype, valid_comp ? "SUCCESS" : "TIMEOUT",
         cons_idx, prod_idx, cq->cqn, cq->qpn,
         ibgda_atomic_read(cq->resv_head), ibgda_atomic_read(cq->ready_head), idx,
-        ibgda_atomic_read((uint64_t*)&cqe64_bnxt->qp_handle),
         cqe_status);
+#else
+    if (valid_comp)
+        printf(
+            "[%d] ibgda_poll_cq %s: \n"
+            "    cons_idx=%#lx, prod_idx=%#lx, cqn=%#x, qpn=%#x \n"
+            "    resv_head=%#lx, ready_head=%#lx\n"
+            "    while waiting for idx=%#lx. cqe_status 0x%x\n",
+            nvshmemi_device_state_d.mype, valid_comp ? "SUCCESS" : "TIMEOUT",
+            cons_idx, prod_idx, cq->cqn, cq->qpn,
+            ibgda_atomic_read(cq->resv_head), ibgda_atomic_read(cq->ready_head), idx,
+            cqe_status);
 #endif
 
     return status;
@@ -949,16 +958,14 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_ring_db(
     nvshmemi_ibgda_device_qp_t *qp, uint16_t prod_idx) {
     uint64_t *bf_ptr = (uint64_t *)qp->tx_wq.bf;
     struct bnxt_re_db_hdr hdr;
-    // Won't wrap in the middle of a WQE
-    uint32_t last_slot_idx = prod_idx << BNXT_RE_STATIC_WQE_SHIFT + BNXT_RE_STATIC_WQE_SIZE_SLOTS - 1;
 
     // Convert WQE idx to slot idx
     bnxt_re_init_db_hdr(&hdr, prod_idx * BNXT_RE_STATIC_WQE_SIZE_SLOTS, 0,
                     qp->qpn, BNXT_RE_QUE_TYPE_SQ);
 
 #ifdef NVSHMEM_IBGDA_DEBUG
-    printf("From %s %d qpn 0x%x last %#x %#x at 0x%lx 0x%x 0x%lx\n",
-                    __func__, __LINE__, qp->qpn, last_slot_idx, prod_idx,
+    printf("From %s %d qpn 0x%x prod_idx %#x at 0x%lx nwqes 0x%x cq_handle 0x%lx\n",
+                    __func__, __LINE__, qp->qpn, prod_idx,
                     (unsigned long)bf_ptr, qp->tx_wq.nwqes, (unsigned long)qp->tx_wq.cq);
 #endif
     // Write to the actual DB
