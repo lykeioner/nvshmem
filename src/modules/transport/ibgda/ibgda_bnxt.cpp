@@ -2142,7 +2142,7 @@ static int ibgda_setup_gpu_state(nvshmem_transport_t t) {
     int status = 0;
     int cq_idx = 0;
     bool skip_cst = true;
-    bool support_half_av_seg = true;
+    bool support_half_av_seg = false;
 
     assert(ibgda_device_state_h != 0);
     memset(ibgda_device_state_h, 0, sizeof(*ibgda_device_state_h));
