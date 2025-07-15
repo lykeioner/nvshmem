@@ -711,7 +711,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_w
                                 (BNXT_RE_WR_FLAGS_INLINE << BNXT_RE_HDR_FLAGS_SHIFT) |
                                 BNXT_RE_WR_OPCD_RDMA_WRITE);
     ctrl_seg.key_immd = HTOLE32(*(uint32_t *)val);
-    ctrl_seg.lhdr.qkey_len = bytes;
+    ctrl_seg.lhdr.qkey_len = 32;
 
     // Calculate and fill start and end PSN of the WQE
     bnxt_re_fill_psns_for_msntbl(qp, bytes, wqe_idx);
