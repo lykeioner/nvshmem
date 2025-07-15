@@ -711,7 +711,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_w
                                 (BNXT_RE_WR_FLAGS_INLINE << BNXT_RE_HDR_FLAGS_SHIFT) |
                                 BNXT_RE_WR_OPCD_RDMA_WRITE);
     ctrl_seg.key_immd = HTOLE32(*(uint32_t *)val);
-    ctrl_seg.lhdr.qkey_len = 32;
+    ctrl_seg.lhdr.qkey_len = bytes;
 
     // Calculate and fill start and end PSN of the WQE
     bnxt_re_fill_psns_for_msntbl(qp, bytes, wqe_idx);
@@ -753,10 +753,8 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_w
             break;
         case 8:
             // wqe_data_ptr is aligned at 4B. We cannot use uint64_t here.
-            ibgda_store_relaxed(&(((uint32_t *)wqe_data_seg_ptr)[0]),
-                            ((uint32_t *)val)[0] + 1);
-            ibgda_store_relaxed(&(((uint32_t *)wqe_data_seg_ptr)[1]),
-                            ((uint32_t *)val)[1]);
+            ibgda_store_relaxed(&(((uint32_t *)wqe_data_seg_ptr)[0]), ((uint32_t *)val)[0]);
+            ibgda_store_relaxed(&(((uint32_t *)wqe_data_seg_ptr)[1]), ((uint32_t *)val)[1]);
             break;
         default:
             memcpy(wqe_data_seg_ptr, val, bytes);
