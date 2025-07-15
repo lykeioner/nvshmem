@@ -18,7 +18,7 @@
 #include "device_host_transport/nvshmem_common_ibgda.h"
 #include "non_abi/nvshmem_build_options.h"
 #include "utils_device.h"
-#include "bnxt_re_fp_defs.h"
+#include "infiniband/bnxt_re_hsi.h"
 
 #include <algorithm>
 
