@@ -175,6 +175,7 @@ typedef struct {
         uint64_t sq_cons_idx; // HW completed consumer index in slots
         uint64_t get_head;    // last wqe idx + 1 with a "fetch" operation (g, get, amo_fetch)
         uint64_t get_tail;    // last wqe idx + 1 polled with cst; get_tail > get_head is possible
+        uint64_t last_prod_slot_idx;    // Used for variable WQEs
     } tx_wq;
     struct {
         uint64_t resv_head;   // last reserved wqe idx + 1
@@ -186,8 +187,8 @@ typedef struct {
     } ibuf;
     char padding[NVSHMEMI_IBGDA_QP_MANAGEMENT_PADDING];
 } __attribute__((__aligned__(8))) nvshmemi_ibgda_device_qp_management_v1;
-static_assert(sizeof(nvshmemi_ibgda_device_qp_management_v1) == 120,
-              "ibgda_device_qp_management_v1 must be 120 bytes.");
+static_assert(sizeof(nvshmemi_ibgda_device_qp_management_v1) == 128,
+              "ibgda_device_qp_management_v1 must be 128 bytes.");
 
 typedef nvshmemi_ibgda_device_qp_management_v1 nvshmemi_ibgda_device_qp_management_t;
 
@@ -232,7 +233,7 @@ typedef struct nvshmemi_ibgda_device_qp {
 
     nvshmemi_ibgda_device_qp_management_v1 mvars;  // management variables
 } nvshmemi_ibgda_device_qp_v1;
-static_assert(sizeof(nvshmemi_ibgda_device_qp_v1) == 296, "ibgda_device_qp_v1 must be 296 bytes.");
+static_assert(sizeof(nvshmemi_ibgda_device_qp_v1) == 304, "ibgda_device_qp_v1 must be 304 bytes.");
 
 typedef nvshmemi_ibgda_device_qp_v1 nvshmemi_ibgda_device_qp_t;
 

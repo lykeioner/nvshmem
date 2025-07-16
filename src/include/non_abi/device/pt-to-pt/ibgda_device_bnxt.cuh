@@ -391,7 +391,13 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void *ibgda_get_wqe_ptr
     nvshmemi_ibgda_device_qp_t *qp, uint16_t wqe_idx) {
     uint16_t cnt = qp->tx_wq.nwqes;
     uint16_t idx = wqe_idx & (cnt - 1);
+    printf("WARNING: DON'T CALL ibgda_get_wqe_ptr, call ibgda_get_wqe_slot_ptr instead!\n");
     return (void *)((uintptr_t)qp->tx_wq.wqe + (idx << BNXT_RE_STATIC_WQE_SHIFT));
+}
+
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void *ibgda_get_wqe_slot_ptr(
+    nvshmemi_ibgda_device_qp_t *qp, uint64_t slot_idx) {
+    return (void *)((uintptr_t)qp->tx_wq.wqe + slot_idx * BNXT_RE_SLOT_SIZE_BB);
 }
 
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
@@ -551,6 +557,33 @@ check_opcode:
     return status;
 }
 
+// Updates the last slot idx unconditionally without wrap consideration
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint64_t ibgda_update_slot_idx(
+    nvshmemi_ibgda_device_qp_t *qp, uint64_t num_slots) {
+    nvshmemi_ibgda_device_qp_management_t *mvars = &qp->mvars;
+
+    return atomicAdd((unsigned long long int *)&mvars->tx_wq.last_prod_slot_idx, num_slots);
+}
+
+// Lock must be taken prior
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint16_t ibgda_get_adjusted_slot_idx(
+    nvshmemi_ibgda_device_qp_t *qp) {
+    nvshmemi_ibgda_device_qp_management_t *mvars = &qp->mvars;
+    uint64_t new_prod_slot_idx;
+
+    // Atomic read
+    new_prod_slot_idx = atomicAdd((unsigned long long int *)&mvars->tx_wq.last_prod_slot_idx,
+                                  (unsigned long long int)0);
+    // Take care of wrap cases
+    new_prod_slot_idx %= (qp->tx_wq.nwqes * BNXT_RE_STATIC_WQE_SIZE_SLOTS);
+
+    // Write back to the context
+    atomicExch((unsigned long long int *)&mvars->tx_wq.last_prod_slot_idx,
+               (unsigned long long int)new_prod_slot_idx);
+
+    return (uint16_t)new_prod_slot_idx;
+}
+
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_nop_wqe(
     nvshmemi_ibgda_device_qp_t *qp, uint16_t wqe_idx, void **out_wqes) {
     return;
@@ -580,13 +613,12 @@ __device__ uint64_t bnxt_re_update_msn_tbl(uint32_t st_idx, uint32_t npsn, uint3
 }
 
 __device__ void bnxt_re_fill_psns_for_msntbl(nvshmemi_ibgda_device_qp_t *qp, uint32_t len,
-                                            uint16_t wqe_idx) {
+                                            uint16_t slot_st_idx) {
    uint32_t npsn = 0, start_psn = 0, next_psn = 0;
    struct bnxt_re_msns msns;
    uint64_t *msns_ptr;
    uint32_t pkt_cnt = 0;
    /* Start slot index of the WQE */
-   uint32_t st_idx = wqe_idx * BNXT_RE_STATIC_WQE_SIZE_SLOTS;
 
    // Get the MSN table address
    msns_ptr = (uint64_t *)bnxt_re_pull_psn_buff(qp);
@@ -611,7 +643,7 @@ __device__ void bnxt_re_fill_psns_for_msntbl(nvshmemi_ibgda_device_qp_t *qp, uin
        next_psn = qp->sq_psn + pkt_cnt;
        npsn = next_psn;
        qp->sq_psn = next_psn;
-       msns.start_idx_next_psn_start_psn |= bnxt_re_update_msn_tbl(st_idx, npsn, start_psn);
+       msns.start_idx_next_psn_start_psn |= bnxt_re_update_msn_tbl(slot_st_idx, npsn, start_psn);
        qp->msn++;
        qp->msn %= qp->msn_tbl_sz;
    }
@@ -694,30 +726,27 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_w
 template <bool support_half_av_seg>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_write_inl_wqe(
     nvshmemi_ibgda_device_qp_t *qp, nvshmemi_ibgda_device_dct_t *dct, const void *val,
-    uint64_t raddr, __be32 rkey, uint32_t bytes, uint16_t wqe_idx, uint8_t fm_ce_se,
+    uint64_t raddr, __be32 rkey, uint32_t bytes, uint16_t wqe_slot_idx, uint8_t fm_ce_se,
     void **out_wqes) {
     ibgda_bnxt_ctrl_seg_t ctrl_seg;
     struct bnxt_re_rdma raddr_seg;
-    struct bnxt_re_sge data_seg2;
+    uint8_t slots = 2;
 
     ibgda_bnxt_ctrl_seg_t *ctrl_seg_ptr = (ibgda_bnxt_ctrl_seg_t *)out_wqes[0];
     auto raddr_seg_ptr = reinterpret_cast<struct bnxt_re_rdma *>(reinterpret_cast<uintptr_t>(ctrl_seg_ptr) + sizeof(*ctrl_seg_ptr));
     auto wqe_data_seg_ptr = reinterpret_cast<struct bnxt_re_sge *>(reinterpret_cast<uintptr_t>(raddr_seg_ptr) + sizeof(*raddr_seg_ptr));
-    auto data_seg2_ptr = reinterpret_cast<struct bnxt_re_sge *>(reinterpret_cast<uintptr_t>(wqe_data_seg_ptr) + sizeof(*wqe_data_seg_ptr));
 
     // Allow up to 12 bytes
-    assert(likely(bytes <= 12));
+    //assert(likely(bytes <= 12));
 
+    slots += (bytes + (BNXT_RE_SLOT_SIZE_BB - 1)) / BNXT_RE_SLOT_SIZE_BB;
     ctrl_seg = { 0 };
-    ctrl_seg.rsv_ws_fl_wt = HTOLE32((BNXT_RE_STATIC_WQE_SIZE_SLOTS << BNXT_RE_HDR_WS_SHIFT) |
+    ctrl_seg.rsv_ws_fl_wt = HTOLE32((slots << BNXT_RE_HDR_WS_SHIFT) |
                                 (BNXT_RE_WR_FLAGS_SIGNALED << BNXT_RE_HDR_FLAGS_SHIFT) |
                                 (BNXT_RE_WR_FLAGS_INLINE << BNXT_RE_HDR_FLAGS_SHIFT) |
                                 BNXT_RE_WR_OPCD_RDMA_WRITE);
     ctrl_seg.key_immd = HTOLE32(*(uint32_t *)val);
-    ctrl_seg.lhdr.qkey_len = 32;
-
-    // Calculate and fill start and end PSN of the WQE
-    bnxt_re_fill_psns_for_msntbl(qp, bytes, wqe_idx);
+    ctrl_seg.lhdr.qkey_len = HTOLE32(bytes);
 
     raddr_seg.rva = HTOLE64(raddr);
     raddr_seg.rkey = HTOBE32(rkey);
@@ -769,11 +798,9 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_w
     printf("      : %08x %08x\n", (dst[3]), (dst[2]));
 #endif
 
-    data_seg2 = { 0 };
-    dst = (uint32_t *)data_seg2_ptr;
-    src = (uint32_t *)&data_seg2;
-    for (int i = 0; i < sizeof(*data_seg2_ptr) / sizeof(uint32_t); ++i)
-        ibgda_store_relaxed(&dst[i], src[i]);
+    ibgda_update_slot_idx(qp, slots);
+    // Calculate and fill start and end PSN of the WQE
+    bnxt_re_fill_psns_for_msntbl(qp, bytes, wqe_slot_idx);
 }
 
 /**
@@ -956,13 +983,11 @@ __device__ void bnxt_re_init_db_hdr(struct bnxt_re_db_hdr *hdr,
 }
 
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_ring_db(
-    nvshmemi_ibgda_device_qp_t *qp, uint16_t prod_idx) {
+    nvshmemi_ibgda_device_qp_t *qp, uint16_t prod_slot_idx) {
     uint64_t *bf_ptr = (uint64_t *)qp->tx_wq.bf;
     struct bnxt_re_db_hdr hdr;
 
-    // Convert WQE idx to slot idx
-    bnxt_re_init_db_hdr(&hdr, prod_idx * BNXT_RE_STATIC_WQE_SIZE_SLOTS, 0,
-                    qp->qpn, BNXT_RE_QUE_TYPE_SQ);
+    bnxt_re_init_db_hdr(&hdr, prod_slot_idx, 0, qp->qpn, BNXT_RE_QUE_TYPE_SQ);
 
 #ifdef NVSHMEM_IBGDA_DEBUG
     printf("From %s %d qpn 0x%x prod_idx %#x at 0x%lx nwqes 0x%x cq_handle 0x%lx\n",
@@ -991,7 +1016,8 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_post_send(
 
     if (likely(new_prod_idx > old_prod_idx)) {
         IBGDA_MEMBAR();
-        ibgda_ring_db(qp, new_prod_idx);
+        // Use the slot idx instead
+        ibgda_ring_db(qp, ibgda_get_adjusted_slot_idx(qp));
     }
 
     ibgda_lock_release<NVSHMEMI_THREADGROUP_THREAD>(&mvars->post_send_lock);
@@ -1863,6 +1889,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_rma
     assert(rchunk_size >= sizeof(T));
 
     int num_wqes_per_cmd;
+    int num_wqe_slots_per_cmd = 0;
     int num_wqes;
 
     bool need_additional_wqe = false;
@@ -1884,6 +1911,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_rma
         num_wqes_per_cmd =
             (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) ? (support_half_av_seg ? 1 : 2) : 1;
         num_wqes = num_wqes_per_cmd * tg_size;
+        num_wqe_slots_per_cmd = 3;
     }
 
     if (!can_combine_data && num_wqes_per_cmd > 1) {
@@ -1891,14 +1919,18 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_rma
         need_additional_wqe = true;
     }
 
-    uint64_t base_wqe_idx;
+    uint64_t base_wqe_idx = 0;
+    uint64_t base_slot_idx = 0;
 
     if (my_tid == 0) {
         base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas);
+        base_slot_idx = ibgda_update_slot_idx(qp, 0);
     }
 
     if (is_full_warp) {
+        // Sync the following base variables for all threads within a WARP
         base_wqe_idx = __shfl_sync(IBGDA_FULL_WARP, base_wqe_idx, 0);
+        base_slot_idx = __shfl_sync(IBGDA_FULL_WARP, base_slot_idx, 0);
     }
 
     // Generate CQE only if we create the last WQE in the group.
@@ -1906,12 +1938,10 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_rma
 
     uint64_t my_wqe_idx =
         can_combine_data ? base_wqe_idx : base_wqe_idx + (my_tid * num_wqes_per_cmd);
+    uint64_t my_wqe_slot_idx = base_slot_idx + (my_tid * num_wqe_slots_per_cmd);
 
-    void *wqe_ptrs[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        wqe_ptrs[i] = ibgda_get_wqe_ptr(qp, my_wqe_idx + i);
-    }
+    void *wqe_ptrs[1];
+    wqe_ptrs[0] = ibgda_get_wqe_slot_ptr(qp, my_wqe_slot_idx);
 
     if (can_combine_data && sizeof(T) == 8 && qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI)
         ibgda_write_rdma_write_inl_wqe_combine_warp_for_dci_8B<T>(qp, dct, value, raddr, rkey,
@@ -1921,7 +1951,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_rma
                                                        my_tid, wqe_ptrs);
     else
         ibgda_write_rdma_write_inl_wqe<support_half_av_seg>(qp, dct, &value, raddr, rkey, sizeof(T),
-                                                            my_wqe_idx, fm_ce_se, wqe_ptrs);
+                                                            my_wqe_slot_idx, fm_ce_se, wqe_ptrs);
 
     if (is_full_warp) nvshmemi_warp_sync();
 
