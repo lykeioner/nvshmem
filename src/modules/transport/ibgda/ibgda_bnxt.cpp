@@ -2124,6 +2124,7 @@ static int ibgda_setup_gpu_state(nvshmem_transport_t t) {
     const size_t mvars_offset = offsetof(nvshmemi_ibgda_device_qp_t, mvars);
     const size_t prod_idx_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.prod_idx);
     const size_t cons_t_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.cons_idx);
+    const size_t cons_t_done_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.sq_cons_idx);
     const size_t wqe_h_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.resv_head);
     const size_t wqe_t_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.ready_head);
     const size_t rx_resv_head_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, rx_wq.resv_head);
@@ -2230,6 +2231,7 @@ static int ibgda_setup_gpu_state(nvshmem_transport_t t) {
 
             ibgda_get_device_cq(&cq_h[cq_idx], device->dci.eps[i]->send_cq);
             cq_h[cq_idx].cons_idx = (uint64_t *)(base_mvars_d_addr + cons_t_offset);
+            cq_h[cq_idx].sq_cons_idx = (uint64_t *)(base_mvars_d_addr + cons_t_done_offset);
             cq_h[cq_idx].resv_head = (uint64_t *)(base_mvars_d_addr + wqe_h_offset);
             cq_h[cq_idx].ready_head = (uint64_t *)(base_mvars_d_addr + wqe_t_offset);
             cq_h[cq_idx].qpn = dci_h[arr_idx].qpn;
@@ -2267,6 +2269,7 @@ static int ibgda_setup_gpu_state(nvshmem_transport_t t) {
 
                 ibgda_get_device_cq(&cq_h[cq_idx], device->rc.eps[i]->send_cq);
                 cq_h[cq_idx].cons_idx = (uint64_t *)(base_mvars_d_addr + cons_t_offset);
+                cq_h[cq_idx].sq_cons_idx = (uint64_t *)(base_mvars_d_addr + cons_t_done_offset);
                 cq_h[cq_idx].resv_head = (uint64_t *)(base_mvars_d_addr + wqe_h_offset);
                 cq_h[cq_idx].ready_head = (uint64_t *)(base_mvars_d_addr + wqe_t_offset);
                 cq_h[cq_idx].qpn = rc_h[arr_idx].qpn;

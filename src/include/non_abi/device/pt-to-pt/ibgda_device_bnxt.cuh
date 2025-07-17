@@ -436,7 +436,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
     uint64_t start = ibgda_query_globaltimer();
     uint64_t now;
 #endif
-    uint64_t hwcqe_cons_idx = 0;
     bnxt_re_bcqe *hdr;
     uint32_t flg_val;
     struct bnxt_re_req_cqe *hwcqe = (struct bnxt_re_req_cqe *)cq->cqe;
@@ -459,7 +458,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
         hwcqe = (struct bnxt_re_req_cqe *)((unsigned long)cq->cqe +
                  (cons_idx * bnxt_re_get_cqe_sz()));
         hdr = (bnxt_re_bcqe*)((unsigned long)hwcqe + sizeof(bnxt_re_req_cqe));
-        flg_val = LE32TOH(hdr->flg_st_typ_ph);
+        flg_val = LE32TOH(ibgda_atomic_read(&hdr->flg_st_typ_ph));
 
 #ifdef NVSHMEM_IBGDA_DEBUG
         uint32_t *cqe_slot;
@@ -487,11 +486,15 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
             cqe_status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) &
                           BNXT_RE_BCQE_STATUS_MASK;
             valid_comp = true;
+
             // cq->cons_idx is local tracking of consumer of CQ.
-            *cq->cons_idx = cons_idx;
-            hwcqe_cons_idx = hwcqe->con_indx;
-            if (!cqe_status)
+            atomicMax((unsigned long long int *)cq->cons_idx, (unsigned long long int)cons_idx);
+            atomicMax((unsigned long long int *)cq->sq_cons_idx, (unsigned long long int)hwcqe->con_indx);
+
+            if (cqe_status) {
+                status = -1;
                 goto check_opcode;
+	    }
         }
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
         // TODO: Integrate timeout handler with the core NVSHMEM
@@ -502,7 +505,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
         // TBD - We need proper handling here.
         // Poll might be called for those CQs as well, which has never
         // done any posting.
-    } while (idx > hwcqe_cons_idx);
+    } while (idx > ibgda_atomic_read(cq->sq_cons_idx));
 
     // Prevent reordering of the opcode wait above
     IBGDA_MFENCE();
