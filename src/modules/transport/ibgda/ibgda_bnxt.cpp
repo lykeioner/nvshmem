@@ -2068,6 +2068,7 @@ static void ibgda_get_device_qp(nvshmemi_ibgda_device_qp_t *dev_qp, struct ibgda
     }
 
     dev_qp->tx_wq.nwqes = ep->sq_cnt;
+    dev_qp->tx_wq.sq_depth = dev_qp->tx_wq.nwqes * BNXT_RE_STATIC_WQE_SIZE_SLOTS;
 
     ibuf_dci_start = (uintptr_t)device->qp_shared_object.internal_buf.mem_object->aligned.gpu_ptr;
     ibuf_rc_start = ibuf_dci_start + (size_per_dci * device->dci.num_eps);

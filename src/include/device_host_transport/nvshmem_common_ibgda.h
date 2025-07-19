@@ -211,6 +211,7 @@ typedef struct nvshmemi_ibgda_device_qp {
         nvshmemi_ibgda_device_cq_t *cq;
         // May point to mvars.prod_idx or internal prod_idx
         uint64_t *prod_idx;
+        uint64_t sq_depth;    // = nwqes * BNXT_RE_STATIC_WQE_SIZE_SLOTS
     } tx_wq;
     struct {
         uint16_t nwqes;
@@ -233,7 +234,7 @@ typedef struct nvshmemi_ibgda_device_qp {
 
     nvshmemi_ibgda_device_qp_management_v1 mvars;  // management variables
 } nvshmemi_ibgda_device_qp_v1;
-static_assert(sizeof(nvshmemi_ibgda_device_qp_v1) == 304, "ibgda_device_qp_v1 must be 304 bytes.");
+static_assert(sizeof(nvshmemi_ibgda_device_qp_v1) == 312, "ibgda_device_qp_v1 must be 312 bytes.");
 
 typedef nvshmemi_ibgda_device_qp_v1 nvshmemi_ibgda_device_qp_t;
 

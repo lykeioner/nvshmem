@@ -557,31 +557,23 @@ check_opcode:
     return status;
 }
 
-// Updates the last slot idx unconditionally without wrap consideration
+// Updates the last slot idx unconditionally with wrap consideration
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint64_t ibgda_update_slot_idx(
     nvshmemi_ibgda_device_qp_t *qp, uint64_t num_slots) {
-    nvshmemi_ibgda_device_qp_management_t *mvars = &qp->mvars;
+    unsigned long long int *addr, oldval, assumed, newval;
 
-    return atomicAdd((unsigned long long int *)&mvars->tx_wq.last_prod_slot_idx, num_slots);
-}
+    addr = (unsigned long long int *)&qp->mvars.tx_wq.last_prod_slot_idx;
+    if (!num_slots)
+        return atomicAdd(addr, num_slots);
 
-// Lock must be taken prior
-__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint16_t ibgda_get_adjusted_slot_idx(
-    nvshmemi_ibgda_device_qp_t *qp) {
-    nvshmemi_ibgda_device_qp_management_t *mvars = &qp->mvars;
-    uint64_t new_prod_slot_idx;
+    oldval = *addr;
+    do {
+        assumed = oldval;
+        newval = (assumed + num_slots) % qp->tx_wq.sq_depth;
+        oldval = atomicCAS(addr, assumed, newval);
+    } while (oldval != assumed);
 
-    // Atomic read
-    new_prod_slot_idx = atomicAdd((unsigned long long int *)&mvars->tx_wq.last_prod_slot_idx,
-                                  (unsigned long long int)0);
-    // Take care of wrap cases
-    new_prod_slot_idx %= (qp->tx_wq.nwqes * BNXT_RE_STATIC_WQE_SIZE_SLOTS);
-
-    // Write back to the context
-    atomicExch((unsigned long long int *)&mvars->tx_wq.last_prod_slot_idx,
-               (unsigned long long int)new_prod_slot_idx);
-
-    return (uint16_t)new_prod_slot_idx;
+    return newval;
 }
 
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_nop_wqe(
@@ -1017,7 +1009,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_post_send(
     if (likely(new_prod_idx > old_prod_idx)) {
         IBGDA_MEMBAR();
         // Use the slot idx instead
-        ibgda_ring_db(qp, ibgda_get_adjusted_slot_idx(qp));
+        ibgda_ring_db(qp, qp->mvars.tx_wq.last_prod_slot_idx);
     }
 
     ibgda_lock_release<NVSHMEMI_THREADGROUP_THREAD>(&mvars->post_send_lock);
