@@ -300,7 +300,11 @@ static int ep_create(nvshmem_transport_t t, struct ibrc_ep **ep_ptr, int devid,
     memset((void *)ep, 0, sizeof(struct ibrc_ep));
 
     if (!device->send_cq) {
+#ifdef NVSHMEM_IBRC_MLX_SUPPORT
         device->send_cq = ftable.create_cq(context, device->device_attr.max_cqe, NULL, NULL, 0);
+#else
+        device->send_cq = ftable.create_cq(context, ibrc_qp_depth, NULL, 0);
+#endif
         NVSHMEMI_NULL_ERROR_JMP(device->send_cq, status, NVSHMEMX_ERROR_INTERNAL, out,
                                 "cq creation failed \n");
     }
@@ -318,7 +322,11 @@ static int ep_create(nvshmem_transport_t t, struct ibrc_ep **ep_ptr, int devid,
         NVSHMEMI_NULL_ERROR_JMP(device->srq, status, NVSHMEMX_ERROR_INTERNAL, out,
                                 "srq creation failed \n");
 
+#ifdef NVSHMEM_IBRC_MLX_SUPPORT
         device->recv_cq = ftable.create_cq(context, ibrc_srq_depth, NULL, NULL, 0);
+#else
+        device->recv_cq = ftable.create_cq(context, ibrc_srq_depth, NULL, 0);
+#endif
         NVSHMEMI_NULL_ERROR_JMP(device->recv_cq, status, NVSHMEMX_ERROR_INTERNAL, out,
                                 "cq creation failed \n");
     }

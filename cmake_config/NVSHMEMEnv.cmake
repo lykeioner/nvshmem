@@ -82,6 +82,7 @@ nvshmem_add_default_off_option(NVSHMEM_VERBOSE "Enable the ptxas verbose compila
 nvshmem_add_default_off_option(NVSHMEM_ENV_ALL "Display all runtime environment variables, regardless of build settings")
 nvshmem_add_default_off_option(NVSHMEM_USE_AMO_OPS "Toggles NVSHMEM to use amo operations")
 nvshmem_add_default_off_option(NVSHMEM_IBGDA_MLX_SUPPORT "Toggles IBGDA FP between mlx and bnxt")
+nvshmem_add_default_off_option(NVSHMEM_IBRC_MLX_SUPPORT "Toggles IBRC support between mlx and bnxt")
 message( "___________________________________________________________________________________________________\n\n")
 
 

@@ -63,7 +63,11 @@ struct nvshmemt_ibv_function_table {
     struct ibv_mr *(*reg_dmabuf_mr)(struct ibv_pd *pd, uint64_t offset, size_t length,
                                     uint64_t iova, int fd, int access);
     int (*dereg_mr)(struct ibv_mr *mr);
+#ifdef NVSHMEM_IBRC_MLX_SUPPORT
     struct ibv_cq *(*create_cq)(struct ibv_context *context, int cqe, void *cq_context,
+#else
+    struct ibv_cq *(*create_cq)(struct ibv_context *context, int cqe,
+#endif
                                 struct ibv_comp_channel *channel, int comp_vector);
     struct ibv_qp *(*create_qp)(struct ibv_pd *pd, struct ibv_qp_init_attr *qp_init_attr);
     struct ibv_srq *(*create_srq)(struct ibv_pd *pd, struct ibv_srq_init_attr *srq_init_attr);
