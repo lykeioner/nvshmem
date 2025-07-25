@@ -1532,7 +1532,11 @@ static int ibgda_create_qp_shared_objects(nvshmemt_ibgda_state_t *ibgda_state,
                           "This may occur if your ofed is older than version 5.0.\n");
 
     // Create recv_cq on host memory.
+#ifdef NVSHMEM_IBGDA_MLX_SUPPORT
     recv_cq = ftable.create_cq(context, ibgda_srq_depth, NULL, NULL, 0);
+#else
+    recv_cq = ftable.create_cq(context, ibgda_srq_depth, NULL, 0);
+#endif
     NVSHMEMI_NULL_ERROR_JMP(recv_cq, status, NVSHMEMX_ERROR_INTERNAL, out,
                             "ibv_create_cq for recv_cq failed.\n");
 
