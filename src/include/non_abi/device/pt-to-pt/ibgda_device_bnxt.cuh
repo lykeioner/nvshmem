@@ -20,12 +20,6 @@
 #include "utils_device.h"
 #include "infiniband/bnxt_re_hsi.h"
 
-// TBD - Currently use this define and avoid using
-// BNXT_RE_STATIC_WQE_SIZE_SLOTS
-#if defined BNXT_RE_STATIC_WQE_SIZE_SLOTS
-#undef  BNXT_RE_STATIC_WQE_SIZE_SLOTS
-#endif
-
 #include <algorithm>
 
 #undef HTOLE16
@@ -96,18 +90,6 @@
 #define IBGDA_8_BYTE_EXT_AMO_OPMOD 0x09000000
 
 typedef struct bnxt_re_bsqe __attribute__((__aligned__(8))) ibgda_bnxt_ctrl_seg_t;
-
-// The ext flag (in dqp_dct) must be set to disable.
-typedef struct {
-    __be64 dc_key;
-    __be32 dqp_dct;
-    uint8_t stat_rate_sl;
-    uint8_t fl_mlid;
-    __be16 rlid;
-} __attribute__((__packed__)) __attribute__((__aligned__(4))) ibgda_half_av_seg_t;
-#if __cplusplus >= 201103L
-static_assert(sizeof(ibgda_half_av_seg_t) == 16, "sizeof(ibgda_half_av_seg_t) == 16 failed.");
-#endif
 
 typedef struct {
     uint32_t add_data;
@@ -354,6 +336,24 @@ ibgda_cal_transfer_size(size_t req_size, size_t lchunk_size, size_t rchunk_size)
 }
 
 template <threadgroup_t SCOPE>
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void global_lock_acquire(int *lock) {
+    // Attempt to acquire lock by swapping 0 → 1
+    while (atomicCAS(lock, 0, 1) != 0) {
+        // Optional: backoff or __nanosleep to reduce contention
+    }
+
+    // Ensure all memory operations after the lock are not reordered before it
+    __threadfence();
+}
+
+template <threadgroup_t SCOPE>
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void global_lock_release(int *lock) {
+    // Ensure all memory operations are complete before releasing
+    __threadfence();
+    atomicExch(lock, 0);
+}
+
+template <threadgroup_t SCOPE>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_lock_acquire(int *lock) {
     if (nvshmemi_thread_id_in_threadgroup<SCOPE>() == 0)
         while (atomicCAS(lock, 0, 1) == 1)
@@ -393,12 +393,10 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_update_get_t
               (unsigned long long int)new_get_tail);
 }
 
-__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void *ibgda_get_wqe_ptr(
-    nvshmemi_ibgda_device_qp_t *qp, uint16_t wqe_idx) {
-    uint16_t cnt = qp->tx_wq.nwqes;
-    uint16_t idx = wqe_idx & (cnt - 1);
-    return (void *)((uintptr_t)qp->tx_wq.wqe +
-                   (idx * NVSHMEMI_IBGDA_BNXT_STATIC_WQE_SLOTS * BNXT_RE_SLOT_SIZE_BB));
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void *ibgda_get_wqe_slot_ptr(
+    nvshmemi_ibgda_device_qp_t *qp, uint64_t slot_idx) {
+    slot_idx = slot_idx % qp->tx_wq.sq_depth;
+    return (void *)((uintptr_t)qp->tx_wq.wqe + slot_idx * BNXT_RE_SLOT_SIZE_BB);
 }
 
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
@@ -435,9 +433,12 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_check_poll_ti
 static_assert(NVSHMEMI_IBGDA_MAX_QP_DEPTH <= 32768,
               "static_assert(NVSHMEMI_IBGDA_MAX_QP_DEPTH <= 32768) failed");
 #endif
+
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
     nvshmemi_ibgda_device_cq_t *cq, uint64_t idx, int *error) {
     int status = 0;
+
+    assert(likely(cq->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC));
 
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
     uint64_t start = ibgda_query_globaltimer();
@@ -446,14 +447,25 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
     bnxt_re_bcqe *hdr;
     uint32_t flg_val;
     struct bnxt_re_req_cqe *hwcqe = (struct bnxt_re_req_cqe *)cq->cqe;
+#ifdef NVSHMEM_IBGDA_DEBUG
+    bool valid_comp = false;
+#endif
+    uint8_t cqe_status = 0;
+
+    // If idx is a lot greater than cons_idx, we might get incorrect result due
+    // to wqe_counter wraparound. We need to check prod_idx to be sure that idx
+    // has already been submitted.
+    while (unlikely(ibgda_atomic_read(cq->prod_idx) < idx))
+        ;
+    IBGDA_MFENCE();
+
+    global_lock_acquire<NVSHMEMI_THREADGROUP_THREAD>(cq->poll_cq_lock);
 
     auto cons_idx = ibgda_atomic_read(cq->cons_idx);
     auto prod_idx = ibgda_atomic_read(cq->prod_idx);
-    bool valid_comp = false;
-    uint8_t cqe_status = 0;
-
-    assert(likely(cq->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI ||
-                  cq->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC));
+    auto cqe_idx = ibgda_atomic_read(cq->cqe_idx);
+    if (idx <= cons_idx)
+        goto poll_done;
 
     // Handle some CQ polling TBD. CQ poll might be called for periodic
     // check and it is possible to have no potential completion on that CQ.
@@ -461,9 +473,10 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
     do {
         cons_idx = ibgda_atomic_read(cq->cons_idx);
         prod_idx = ibgda_atomic_read(cq->prod_idx);
+        cqe_idx = ibgda_atomic_read(cq->cqe_idx);
 
         hwcqe = (struct bnxt_re_req_cqe *)((unsigned long)cq->cqe +
-                 (cons_idx * bnxt_re_get_cqe_sz()));
+                 (cqe_idx * bnxt_re_get_cqe_sz()));
         hdr = (bnxt_re_bcqe*)((unsigned long)hwcqe + sizeof(bnxt_re_req_cqe));
         flg_val = LE32TOH(ibgda_atomic_read(&hdr->flg_st_typ_ph));
 
@@ -478,30 +491,36 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
                  (cqe_slot[3]), (cqe_slot[2]), cq->cqn, cons_idx + i);
             cqe_slot = cqe_slot + 4;
         }
-        printf("qpn %d cqn %d flg_val %08x  ready_head 0x%lx resv_head 0x%lx "
-            "idx from caller 0x%lx tx prod 0x%lx tx cons 0x%lx (hw sq_cons 0x%x) phase 0x%x\n",
+        printf("qpn 0x%x cqn 0x%x flg_val %08x  resv_head 0x%lx ready_head 0x%lx "
+            "idx from caller 0x%lx tx prod 0x%lx tx cons 0x%lx/0x%lx "
+            "(hw sq_cons 0x%x) phase 0x%lx\n",
             cq->qpn, cq->cqn, flg_val, ibgda_atomic_read(cq->resv_head),
             ibgda_atomic_read(cq->ready_head), idx,
-            prod_idx, cons_idx, hwcqe->con_indx, cq->phase);
+            prod_idx, cons_idx, cqe_idx, hwcqe->con_indx, ibgda_atomic_read(cq->cq_phase));
 #endif
 
-        if (bnxt_re_is_cqe_valid(flg_val, cq->phase)) {
-            // TBD - Fix below
-            if (!++cons_idx) {
-                cq->phase = !cq->phase;
-            }
+        if (bnxt_re_is_cqe_valid(flg_val, (uint32_t)ibgda_atomic_read(cq->cq_phase))) {
+#ifdef NVSHMEM_IBGDA_DEBUG
+            valid_comp = true;
+#endif
+            cqe_idx = (cqe_idx + 1) % cq->ncqes;
+            if (cqe_idx == 0)
+                atomicXor((unsigned long long int *)cq->cq_phase, 0x1);
+            atomicExch((unsigned long long int *)cq->cqe_idx, cqe_idx);
+
+            int wqe_cnt = hwcqe->con_indx - (int)ibgda_atomic_read(cq->sq_cons_idx);
+            if (wqe_cnt < 0)
+                wqe_cnt += cq->sq_size;
+            cons_idx += wqe_cnt;
+            atomicMax((unsigned long long int *)cq->cons_idx, cons_idx);
+            atomicExch((unsigned long long int *)cq->sq_cons_idx, (unsigned long long int)hwcqe->con_indx);
+
             cqe_status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) &
                           BNXT_RE_BCQE_STATUS_MASK;
-            valid_comp = true;
-
-            // cq->cons_idx is local tracking of consumer of CQ.
-            atomicMax((unsigned long long int *)cq->cons_idx, (unsigned long long int)cons_idx);
-            atomicMax((unsigned long long int *)cq->sq_cons_idx, (unsigned long long int)hwcqe->con_indx);
-
             if (cqe_status) {
                 status = -1;
                 goto check_opcode;
-	    }
+            }
         }
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
         // TODO: Integrate timeout handler with the core NVSHMEM
@@ -512,7 +531,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
         // TBD - We need proper handling here.
         // Poll might be called for those CQs as well, which has never
         // done any posting.
-    } while (idx > ibgda_atomic_read(cq->sq_cons_idx));
+    } while (cons_idx < idx);
 
     // Prevent reordering of the opcode wait above
     IBGDA_MFENCE();
@@ -520,12 +539,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
     start = ibgda_query_globaltimer();
 #endif
-    // If idx is a lot greater than cons_idx, we might get incorrect result due
-    // to wqe_counter wraparound. We need to check prod_idx to be sure that idx
-    // has already been submitted.
-    while (unlikely(ibgda_atomic_read(cq->prod_idx) < idx))
-        ;
-    IBGDA_MFENCE();
 
 check_opcode:
     /* TBD CQE_REQ_ERR Case handling*/
@@ -542,46 +555,53 @@ check_opcode:
         cons_idx, prod_idx, cq->cqn, cq->qpn,
         ibgda_atomic_read(cq->resv_head), ibgda_atomic_read(cq->ready_head), idx,
         cqe_status);
-#else
-    //if (valid_comp)
-    if (0)
-        printf(
-            "[%d] ibgda_poll_cq %s: \n"
-            "    cons_idx=%#lx, prod_idx=%#lx, cqn=%#x, qpn=%#x \n"
-            "    resv_head=%#lx, ready_head=%#lx\n"
-            "    while waiting for idx=%#lx. cqe_status 0x%x\n",
-            nvshmemi_device_state_d.mype, valid_comp ? "SUCCESS" : "TIMEOUT",
-            cons_idx, prod_idx, cq->cqn, cq->qpn,
-            ibgda_atomic_read(cq->resv_head), ibgda_atomic_read(cq->ready_head), idx,
-            cqe_status);
 #endif
 
+poll_done:
+    global_lock_release<NVSHMEMI_THREADGROUP_THREAD>(cq->poll_cq_lock);
     return status;
 }
 
-__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_nop_wqe(
-    nvshmemi_ibgda_device_qp_t *qp, uint16_t wqe_idx, void **out_wqes) {
-    return;
+// Updates the last slot idx unconditionally with wrap consideration
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint64_t ibgda_reserve_slot_idx(
+    nvshmemi_ibgda_device_qp_t *qp, uint64_t num_slots) {
+    unsigned long long int *addr, oldval, assumed, newval;
+
+    addr = (unsigned long long int *)&qp->mvars.tx_wq.resv_prod_slot_idx;
+    if (!num_slots)
+        return atomicAdd(addr, 0);  //Safe read
+
+    oldval = atomicAdd(addr, 0);  //First read
+    do {
+        assumed = oldval;
+        newval = (assumed + num_slots) % qp->tx_wq.sq_depth;
+        oldval = atomicCAS(addr, assumed, newval);
+    } while (oldval != assumed);
+
+#ifdef NVSHMEM_IBGDA_DEBUG
+    printf("[%d] update slot idx from %lld to %lld\n",
+           nvshmemi_device_state_d.mype, oldval, newval);
+#endif
+
+    return oldval;
 }
 
-__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_dump_wqe(
-    nvshmemi_ibgda_device_qp_t *qp, uint64_t laddr, __be32 lkey, uint32_t bytes, uint16_t wqe_idx,
-    int fm, void **out_wqes) {
-    assert(0);
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint64_t bnxt_re_get_pkts_per_wqe(
+    nvshmemi_ibgda_device_qp_t *qp, uint64_t data_bytes) {
+    if (!data_bytes)
+        data_bytes = 1;
+    return (data_bytes + qp->mtu - 1) / qp->mtu;
 }
 
 // These MSN table routines need to change to cp the entire 64b into the GPU memory instead
-__device__ void *bnxt_re_pull_psn_buff(nvshmemi_ibgda_device_qp_t *qp) {
-   uint32_t cur_msn;
-   cur_msn = atomicAdd((uint32_t*)(&qp->msn), 1);
-   // TBD - Handle wrapping of msn.
-   // qp->msn %= qp->msn_tbl_sz;
-
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void *bnxt_re_pull_psn_buff(
+    nvshmemi_ibgda_device_qp_t *qp, uint32_t msn_idx) {
    // MSN entries are 64b wide << 3
-   return (void *)(((char *) qp->pad) + ((cur_msn) << 3));
+   return (void *)(((char *) qp->pad) + (msn_idx << 3));
 }
 
-__device__ uint64_t bnxt_re_update_msn_tbl(uint32_t st_idx, uint32_t npsn, uint32_t start_psn) {
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint64_t bnxt_re_update_msn_tbl(
+    uint32_t st_idx, uint32_t npsn, uint32_t start_psn) {
    /* Adjust the field values to their respective ofsets */
    /* In LE64 */
    return ((((uint64_t)(st_idx) << BNXT_RE_SQ_MSN_SEARCH_START_IDX_SHIFT) &
@@ -592,68 +612,37 @@ __device__ uint64_t bnxt_re_update_msn_tbl(uint32_t st_idx, uint32_t npsn, uint3
                        BNXT_RE_SQ_MSN_SEARCH_START_PSN_MASK));
 }
 
-__device__ void bnxt_re_fill_psns_for_msntbl(nvshmemi_ibgda_device_qp_t *qp, uint32_t len,
-                                            uint16_t wqe_idx) {
-   uint32_t npsn = 0, start_psn = 0;
-   struct bnxt_re_msns msns;
-   uint64_t *msns_ptr;
-   uint32_t pkt_cnt = 0;
-   /* Start slot index of the WQE */
-   uint32_t st_idx = wqe_idx * NVSHMEMI_IBGDA_BNXT_STATIC_WQE_SLOTS;
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void bnxt_re_fill_psns_for_msntbl(
+    nvshmemi_ibgda_device_qp_t *qp, uint16_t slot_idx, uint32_t msn_idx, uint32_t start_psn,
+    uint32_t pkt_cnt) {
+    struct bnxt_re_msns msns;
+    uint64_t *msns_ptr;
 
-   // Get the MSN table address
-   msns_ptr = (uint64_t *)bnxt_re_pull_psn_buff(qp);
+    msns_ptr = (uint64_t *)bnxt_re_pull_psn_buff(qp, msn_idx);
+    msns.start_idx_next_psn_start_psn =
+                        bnxt_re_update_msn_tbl(slot_idx, start_psn + pkt_cnt, start_psn);
 
-   // Start PSN is the last recorded PSN
-   // Calculate the packet count based on the len of the WQE/MTU
-   msns.start_idx_next_psn_start_psn = 0;
-   start_psn = qp->sq_psn;
-   pkt_cnt = (len / qp->mtu);
-
-   if (len % qp->mtu)
-       pkt_cnt++;
-   /* Increment the psn even for 0 len packets
-    * e.g. for opcode rdma-write-with-imm-data
-    * with length field = 0
-    */
-   if (len == 0)
-       pkt_cnt = 1;
-
-   /* make it 24 bit */
-   npsn = atomicAdd((uint32_t *)(&qp->sq_psn), (uint32_t)pkt_cnt);
-   msns.start_idx_next_psn_start_psn |= bnxt_re_update_msn_tbl(st_idx, npsn, start_psn);
-
-   ibgda_store_release(msns_ptr, *((uint64_t *)&msns));
-
-#ifdef NVSHMEM_IBGDA_DEBUG
-   uint32_t *dst = NULL;
-   dst = (uint32_t *)msns_ptr;
-   printf("NVSHMEM: psn: %08x %08x (msn_ptr 0x%lx pad 0x%lx qpn 0x%x qp->msn 0x%x psn 0x%x mtu 0x%x) \n",
-	   (dst[1]), (dst[0]), (unsigned long)msns_ptr, (unsigned long)qp->pad,
-	   qp->qpn, qp->msn, qp->sq_psn, qp->mtu);
-#endif
+    ibgda_store_release(msns_ptr, *((uint64_t *)&msns));
 }
 
 template <bool support_half_av_seg>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_write_wqe(
-    nvshmemi_ibgda_device_qp_t *qp, nvshmemi_ibgda_device_dct_t *dct, uint64_t laddr, __be32 lkey,
-    uint64_t raddr, __be32 rkey, uint32_t bytes, uint16_t wqe_idx, uint8_t fm_ce_se,
-    void **out_wqes) {
+    nvshmemi_ibgda_device_qp_t *qp, uint64_t laddr, __be32 lkey, uint64_t raddr, __be32 rkey,
+    uint32_t bytes, uint64_t wqe_slot_idx, uint64_t msn_idx, uint64_t psn, uint32_t npkts,
+    uint8_t fm_ce_se) {
     ibgda_bnxt_ctrl_seg_t ctrl_seg;
     struct bnxt_re_rdma raddr_seg;
     struct bnxt_re_sge data_seg;
-    nvshmemi_ibgda_device_qp_management_t *mvars = &qp->mvars;
-
-    // All segments are within the same WQE
-    ibgda_bnxt_ctrl_seg_t *ctrl_seg_ptr = (ibgda_bnxt_ctrl_seg_t *)out_wqes[0];
+    uint32_t slots = 3;
 
     assert(likely(qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC));
 
-    auto raddr_seg_ptr = reinterpret_cast<struct bnxt_re_rdma *>(reinterpret_cast<uintptr_t>(ctrl_seg_ptr) + sizeof(*ctrl_seg_ptr));
-    auto data_seg_ptr = reinterpret_cast<struct bnxt_re_sge *>(reinterpret_cast<uintptr_t>(raddr_seg_ptr) + sizeof(*raddr_seg_ptr));
+    ibgda_bnxt_ctrl_seg_t *ctrl_seg_ptr = (ibgda_bnxt_ctrl_seg_t *)ibgda_get_wqe_slot_ptr(qp, wqe_slot_idx);
+    struct bnxt_re_rdma *raddr_seg_ptr = (struct bnxt_re_rdma *)ibgda_get_wqe_slot_ptr(qp, wqe_slot_idx + 1);
+    struct bnxt_re_sge *data_seg_ptr = (struct bnxt_re_sge *)ibgda_get_wqe_slot_ptr(qp, wqe_slot_idx + 2);
 
     ctrl_seg = { 0 };
-    ctrl_seg.rsv_ws_fl_wt = HTOLE32((NVSHMEMI_IBGDA_BNXT_STATIC_WQE_SLOTS << BNXT_RE_HDR_WS_SHIFT) |
+    ctrl_seg.rsv_ws_fl_wt = HTOLE32((slots << BNXT_RE_HDR_WS_SHIFT) |
                                     (BNXT_RE_WR_FLAGS_SIGNALED << BNXT_RE_HDR_FLAGS_SHIFT) |
                                     BNXT_RE_WR_OPCD_RDMA_WRITE);
     ctrl_seg.key_immd = 0;
@@ -667,10 +656,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_w
     data_seg.lkey = HTOBE32(lkey);
     data_seg.pa = HTOLE64(laddr);
 
-    ibgda_lock_acquire<NVSHMEMI_THREADGROUP_THREAD>(&mvars->post_send_lock);
-    // Calculate and fill start and end PSN of the WQE
-    bnxt_re_fill_psns_for_msntbl(qp, bytes, wqe_idx);
-    ibgda_lock_release<NVSHMEMI_THREADGROUP_THREAD>(&mvars->post_send_lock);
     uint32_t *dst = (uint32_t *)ctrl_seg_ptr;
     uint32_t *src = (uint32_t *)&ctrl_seg;
     for (int i = 0; i < sizeof(*ctrl_seg_ptr) / sizeof(uint32_t); ++i)
@@ -696,40 +681,33 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_w
     for (int i = 0; i < sizeof(*data_seg_ptr) / sizeof(uint32_t); ++i)
         ibgda_store_relaxed(&dst[i], src[i]);
 
-#ifdef NVSHMEM_IBGDA_DEBUG
-    printf("slot 2: %08x %08x\n", (dst[1]), (dst[0]));
-    printf("      : %08x %08x\n", (dst[3]), (dst[2]));
-#endif
+    // Calculate and fill start and end PSN of the WQE
+    bnxt_re_fill_psns_for_msntbl(qp, wqe_slot_idx, msn_idx, psn, npkts);
 }
 
 template <bool support_half_av_seg>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_write_inl_wqe(
-    nvshmemi_ibgda_device_qp_t *qp, nvshmemi_ibgda_device_dct_t *dct, const void *val,
-    uint64_t raddr, __be32 rkey, uint32_t bytes, uint16_t wqe_idx, uint8_t fm_ce_se,
-    void **out_wqes) {
+    nvshmemi_ibgda_device_qp_t *qp, const void *val, uint64_t raddr, __be32 rkey,
+    uint32_t bytes, uint64_t wqe_slot_idx, uint64_t msn_idx, uint64_t psn, uint8_t fm_ce_se) {
     ibgda_bnxt_ctrl_seg_t ctrl_seg;
     struct bnxt_re_rdma raddr_seg;
-    nvshmemi_ibgda_device_qp_management_t *mvars = &qp->mvars;
+    uint32_t slots = 2;
 
-    ibgda_bnxt_ctrl_seg_t *ctrl_seg_ptr = (ibgda_bnxt_ctrl_seg_t *)out_wqes[0];
-    auto raddr_seg_ptr = reinterpret_cast<struct bnxt_re_rdma *>(reinterpret_cast<uintptr_t>(ctrl_seg_ptr) + sizeof(*ctrl_seg_ptr));
-    auto wqe_data_seg_ptr = reinterpret_cast<struct bnxt_re_sge *>(reinterpret_cast<uintptr_t>(raddr_seg_ptr) + sizeof(*raddr_seg_ptr));
+    ibgda_bnxt_ctrl_seg_t *ctrl_seg_ptr = (ibgda_bnxt_ctrl_seg_t *)ibgda_get_wqe_slot_ptr(qp, wqe_slot_idx);
+    struct bnxt_re_rdma *raddr_seg_ptr = (struct bnxt_re_rdma *)ibgda_get_wqe_slot_ptr(qp, wqe_slot_idx + 1);
+    struct bnxt_re_sge *wqe_data_seg_ptr = (struct bnxt_re_sge *)ibgda_get_wqe_slot_ptr(qp, wqe_slot_idx + 2);
 
     // Allow up to 12 bytes
-    assert(likely(bytes <= 12));
+    //assert(likely(bytes <= 12));
 
+    slots += (bytes + (BNXT_RE_SLOT_SIZE_BB - 1)) / BNXT_RE_SLOT_SIZE_BB;
     ctrl_seg = { 0 };
-    ctrl_seg.rsv_ws_fl_wt = HTOLE32((NVSHMEMI_IBGDA_BNXT_STATIC_WQE_SLOTS << BNXT_RE_HDR_WS_SHIFT) |
+    ctrl_seg.rsv_ws_fl_wt = HTOLE32((slots << BNXT_RE_HDR_WS_SHIFT) |
                                 (BNXT_RE_WR_FLAGS_SIGNALED << BNXT_RE_HDR_FLAGS_SHIFT) |
                                 (BNXT_RE_WR_FLAGS_INLINE << BNXT_RE_HDR_FLAGS_SHIFT) |
                                 BNXT_RE_WR_OPCD_RDMA_WRITE);
     ctrl_seg.key_immd = HTOLE32(*(uint32_t *)val);
     ctrl_seg.lhdr.qkey_len = HTOLE32(bytes);
-
-    // Calculate and fill start and end PSN of the WQE
-    ibgda_lock_acquire<NVSHMEMI_THREADGROUP_THREAD>(&mvars->post_send_lock);
-    bnxt_re_fill_psns_for_msntbl(qp, bytes, wqe_idx);
-    ibgda_lock_release<NVSHMEMI_THREADGROUP_THREAD>(&mvars->post_send_lock);
 
     raddr_seg.rva = HTOLE64(raddr);
     raddr_seg.rkey = HTOBE32(rkey);
@@ -780,16 +758,12 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_w
     printf("slot 2: %08x %08x\n", (dst[1]), (dst[0]));
     printf("      : %08x %08x\n", (dst[3]), (dst[2]));
 #endif
+
+    // Calculate and fill start and end PSN of the WQE
+    bnxt_re_fill_psns_for_msntbl(qp, wqe_slot_idx, msn_idx, psn, 1);
 }
 
 /**
- * For DC, support only half av seg.
- * The header already consumes 1 wqebb and leaves 12 bytes for NVSHMEMI_DEVICE_ALWAYS_INLINE data.
- * The last wqebb is no-op.
- * One wqebb is 64 bytes.
- * Pre-calculate as it is faster to do lookup.
- * Formula: ceil(((sizeof(T) * 32) - 12) / 64) + 2
- *
  * For RC
  * The header already consumes 1 wqebb and leaves 12 + 16 bytes for NVSHMEMI_DEVICE_ALWAYS_INLINE
  * data. The last wqebb is no-op. One wqebb is 64 bytes. Pre-calculate as it is faster to do lookup.
@@ -798,22 +772,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_w
 template <typename T, nvshmemi_ibgda_device_qp_type_t qp_type>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint32_t
 ibgda_get_num_wqes_in_inl_combine_warp() {
-    if (qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) {
-        // DC supports up to 16 DS WQE
-        switch (sizeof(T)) {
-            case 1:
-            case 2:
-                return 3;
-            case 4:
-                return 4;
-            default:
-#ifdef NVSHMEM_IBGDA_DEBUG
-                printf("Unsupported type.\n");
-#endif
-                assert(0);
-                return 0;
-        }
-    } else {
         // RC supports up to 64 DS WQE
         switch (sizeof(T)) {
             case 1:
@@ -830,101 +788,29 @@ ibgda_get_num_wqes_in_inl_combine_warp() {
                 assert(0);
                 return 0;
         }
-    }
-}
-
-/**
- * For DC, support only half av seg.
- * The header already consumes 4 ds and leaves 12 bytes for NVSHMEMI_DEVICE_ALWAYS_INLINE data.
- * One ds is 16 bytes.
- * Pre-calculate as it is faster to do lookup.
- * Formula: ceil(((sizeof(T) * 32) - 12) / 16) + 4
- *
- * For RC
- * The header already consumes 3 ds and leaves 12 bytes for NVSHMEMI_DEVICE_ALWAYS_INLINE data.
- * One ds is 16 bytes.
- * Pre-calculate as it is faster to do lookup.
- * Formula: ceil(((sizeof(T) * 32) - 12) / 16) + 3
- */
-template <typename T, nvshmemi_ibgda_device_qp_type_t qp_type>
-__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint32_t
-ibgda_get_ds_in_inl_combine_warp() {
-    if (qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) {
-        // DC supports up to 16 DS WQE
-        switch (sizeof(T)) {
-            case 1:
-                return 6;
-            case 2:
-                return 8;
-            case 4:
-                return 12;
-            default:
-#ifdef NVSHMEM_IBGDA_DEBUG
-                printf("Unsupported type.\n");
-#endif
-                assert(0);
-                return 0;
-        }
-    } else {
-        // DC supports up to 16 DS WQE
-        switch (sizeof(T)) {
-            case 1:
-                return 5;
-            case 2:
-                return 7;
-            case 4:
-                return 11;
-            case 8:
-                return 19;
-            default:
-#ifdef NVSHMEM_IBGDA_DEBUG
-                printf("Unsupported type.\n");
-#endif
-                assert(0);
-                return 0;
-        }
-    }
 }
 
 template <typename T>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void
-ibgda_write_rdma_write_inl_wqe_combine_warp(nvshmemi_ibgda_device_qp_t *qp,
-                                            nvshmemi_ibgda_device_dct_t *dct, const T val,
-                                            uint64_t _raddr, __be32 rkey, uint16_t wqe_idx,
-                                            int my_tid, void **out_wqes) {
-    assert(0);
-}
-
-/**
- * For DCI with sizeof(T) == 8 only.
- * DC supports up to 16 DS WQE.
- * For sizeof(T) == 8, we split to two WQEs of NVSHMEMI_DEVICE_ALWAYS_INLINE size 8 * 16
- */
-template <typename T>
-__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void
-ibgda_write_rdma_write_inl_wqe_combine_warp_for_dci_8B(nvshmemi_ibgda_device_qp_t *dci,
-                                                       nvshmemi_ibgda_device_dct_t *dct,
-                                                       const T val, uint64_t _raddr, __be32 rkey,
-                                                       uint16_t _wqe_idx, int my_tid,
-                                                       void **out_wqes) {
+ibgda_write_rdma_write_inl_wqe_combine_warp(nvshmemi_ibgda_device_qp_t *qp, const T val,
+                                            uint64_t _raddr, __be32 rkey,
+                                            uint16_t wqe_slot_idx, int my_tid) {
+    // TODO - The write inline data is based on the thread ID
     assert(0);
 }
 
 template <bool support_half_av_seg>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_rdma_read_wqe(
-    nvshmemi_ibgda_device_qp_t *qp, nvshmemi_ibgda_device_dct_t *dct, uint64_t laddr, __be32 lkey,
-    uint64_t raddr, __be32 rkey, uint32_t bytes, uint16_t wqe_idx, uint8_t fm_ce_se,
-    void **out_wqes) {
+    nvshmemi_ibgda_device_qp_t *qp, uint64_t laddr, __be32 lkey,
+    uint64_t raddr, __be32 rkey, uint32_t bytes, uint16_t wqe_slot_idx, uint8_t fm_ce_se) {
     assert(0);
-    // TBD - This can be simple same as ibgda_write_rdma_write_wqe.
+    // TODO - This can be simple same as ibgda_write_rdma_write_wqe.
 }
 
 template <typename T>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint32_t
 ibgda_get_num_wqes_in_atomic(nvshmemi_amo_t amo_op, nvshmemi_ibgda_device_qp_type_t qp_type) {
-    if (qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI)
-        return 2;
-    else if (sizeof(T) == 8) {
+    if (sizeof(T) == 8) {
         // RC
         switch (amo_op) {
             case NVSHMEMI_AMO_SIGNAL:
@@ -943,18 +829,68 @@ ibgda_get_num_wqes_in_atomic(nvshmemi_amo_t amo_op, nvshmemi_ibgda_device_qp_typ
 
 template <bool support_half_av_seg>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_atomic_wqe(
-    nvshmemi_ibgda_device_qp_t *qp, nvshmemi_ibgda_device_dct_t *dct, const void *val_1,
+    nvshmemi_ibgda_device_qp_t *qp, const void *val_1,
     const void *val_2, uint64_t laddr, __be32 lkey, uint64_t raddr, __be32 rkey, uint32_t bytes,
-    uint16_t wqe_idx, nvshmemi_amo_t amo_op, uint8_t fm_ce_se, void **out_wqes) {
+    uint64_t wqe_slot_idx, nvshmemi_amo_t amo_op, uint8_t fm_ce_se) {
+#ifdef IBGDA_USE_AMO_OPS
+    // TODO: Depending on the specific operation, different RDMA ops might be used
+    switch (amo_op) {
+        case NVSHMEMI_AMO_FETCH_INC:
+        case NVSHMEMI_AMO_INC:
+        case NVSHMEMI_AMO_SIGNAL:
+        case NVSHMEMI_AMO_SIGNAL_SET:
+        case NVSHMEMI_AMO_SWAP:
+        case NVSHMEMI_AMO_SET:
+        case NVSHMEMI_AMO_SIGNAL_ADD:
+        case NVSHMEMI_AMO_ADD:
+        case NVSHMEMI_AMO_FETCH_AND:
+        case NVSHMEMI_AMO_AND:
+        case NVSHMEMI_AMO_FETCH_OR:
+        case NVSHMEMI_AMO_OR:
+        case NVSHMEMI_AMO_FETCH_XOR:
+        case NVSHMEMI_AMO_XOR:
+        case NVSHMEMI_AMO_FETCH:
+        case NVSHMEMI_AMO_FETCH_ADD:
+        case NVSHMEMI_AMO_COMPARE_SWAP:
+        default:
+            assert(0);
+            break;
+    }
+#else
+    assert(0);
+#endif
+}
+
+// A NOP WQE essentially is a WQE which does nothing operational
+// The goal of issuing this WQE is to get a completion
+// TODO:  Use a local-invalidate WQE with a MW which is already freed
+// The HW will treat it as a NOP and will get completed if signaled
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_nop_wqe(
+    nvshmemi_ibgda_device_qp_t *qp, uint64_t wqe_slot_idx) {
+    // A local-invalidate with a freed MW WQE allows the NIC to perform a NOP
+    // and at the same time generate fence/completion per request
     assert(0);
 }
 
-__device__ void bnxt_re_init_db_hdr(struct bnxt_re_db_hdr *hdr,
-       uint32_t indx, uint32_t toggle,
-       uint32_t qid, uint32_t typ) {
+// A DUMP WQE essentially is a WQE which performs nothing operational
+// except that it does touch the local address provided and generate a completion
+// TODO:  Use a zero-length RDMA write WQE instead
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_write_dump_wqe(
+    nvshmemi_ibgda_device_qp_t *qp, uint64_t laddr, __be32 lkey, uint32_t bytes,
+    uint64_t wqe_slot_idx, uint8_t fm_ce_se) {
+    // A zero-len write WQE allows the NIC to read laddr, which is always on GPU memory.
+    //ibgda_write_rdma_write_inl_wqe<false>(qp, 0, laddr, lkey, 0, wqe_idx,
+    //                                      fm_ce_se, out_wqes);
+    assert(0);
+}
+
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void bnxt_re_init_db_hdr(
+    struct bnxt_re_db_hdr *hdr, uint32_t indx, uint32_t epoch,
+    uint32_t qid, uint32_t typ) {
    uint64_t key_lo, key_hi;
 
-   key_lo = HTOLE32(indx | toggle);
+   key_lo = HTOLE32((indx & BNXT_RE_DB_INDX_MASK) |
+                    (epoch << BNXT_RE_DB_EPOCH_SHIFT));
    key_hi = HTOLE32((qid & BNXT_RE_DB_QID_MASK) |
             ((typ & BNXT_RE_DB_TYP_MASK) << BNXT_RE_DB_TYP_SHIFT) |
             (0x1UL << BNXT_RE_DB_VALID_SHIFT));
@@ -962,17 +898,17 @@ __device__ void bnxt_re_init_db_hdr(struct bnxt_re_db_hdr *hdr,
 }
 
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_ring_db(
-    nvshmemi_ibgda_device_qp_t *qp, uint16_t prod_idx) {
+    nvshmemi_ibgda_device_qp_t *qp, uint64_t slot_idx) {
+    uint32_t prod_slot_idx = (uint32_t)slot_idx;
+    uint32_t epoch = (uint32_t)ibgda_atomic_read(&qp->mvars.tx_wq.epoch);
     uint64_t *bf_ptr = (uint64_t *)qp->tx_wq.bf;
     struct bnxt_re_db_hdr hdr;
 
-    // Convert WQE idx to slot idx
-    bnxt_re_init_db_hdr(&hdr, prod_idx * NVSHMEMI_IBGDA_BNXT_STATIC_WQE_SLOTS, 0,
-                    qp->qpn, BNXT_RE_QUE_TYPE_SQ);
+    bnxt_re_init_db_hdr(&hdr, prod_slot_idx, epoch, qp->qpn, BNXT_RE_QUE_TYPE_SQ);
 
 #ifdef NVSHMEM_IBGDA_DEBUG
-    printf("From %s %d qpn 0x%x prod_idx %#x at 0x%lx nwqes 0x%x cq_handle 0x%lx\n",
-                    __func__, __LINE__, qp->qpn, prod_idx,
+    printf("From %s %d qpn 0x%x prod_slot_idx %#x at 0x%lx nwqes 0x%x cq_handle 0x%lx\n",
+                    __func__, __LINE__, qp->qpn, prod_slot_idx,
                     (unsigned long)bf_ptr, qp->tx_wq.nwqes, (unsigned long)qp->tx_wq.cq);
 #endif
     // Write to the actual DB
@@ -981,12 +917,12 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_ring_db(
 
 template <bool need_strong_flush>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_post_send(
-    nvshmemi_ibgda_device_qp_t *qp, uint64_t new_prod_idx) {
+    nvshmemi_ibgda_device_qp_t *qp, uint64_t new_prod_idx, uint64_t new_slot_idx) {
     nvshmemi_ibgda_device_qp_management_t *mvars = &qp->mvars;
     uint64_t old_prod_idx;
 
     // Update prod_idx before ringing the db so that we know which index is needed in quiet/fence.
-    ibgda_lock_acquire<NVSHMEMI_THREADGROUP_THREAD>(&mvars->post_send_lock);
+    global_lock_acquire<NVSHMEMI_THREADGROUP_THREAD>(&mvars->post_send_lock);
 
     if (need_strong_flush)
         old_prod_idx = atomicMax((unsigned long long int *)&mvars->tx_wq.prod_idx,
@@ -996,27 +932,41 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_post_send(
                                        (unsigned long long int)new_prod_idx);
 
     if (likely(new_prod_idx > old_prod_idx)) {
+        if (new_slot_idx < atomicAdd((unsigned long long int *)&mvars->tx_wq.posted_prod_slot_idx, 0ULL))
+            atomicXor((unsigned long long int *)&mvars->tx_wq.epoch, 0x1ULL);
+
+        if (need_strong_flush)
+            atomicExch((unsigned long long int *)&mvars->tx_wq.posted_prod_slot_idx,
+                       (unsigned long long int)new_slot_idx);
+        else
+            atomicExch_block((unsigned long long int *)&mvars->tx_wq.posted_prod_slot_idx,
+                             (unsigned long long int)new_slot_idx);
         IBGDA_MEMBAR();
-        ibgda_ring_db(qp, new_prod_idx);
+        ibgda_ring_db(qp, new_slot_idx);
     }
 
-    ibgda_lock_release<NVSHMEMI_THREADGROUP_THREAD>(&mvars->post_send_lock);
+    global_lock_release<NVSHMEMI_THREADGROUP_THREAD>(&mvars->post_send_lock);
 }
 
 // If `qp` is shared among CTAs, need_strong_flush must be set to true because
 // we must push prior writes from this CTA to L2 before coalescing DB.
 template <bool need_strong_flush>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_submit_requests(
-    nvshmemi_ibgda_device_qp_t *qp, uint64_t base_wqe_idx, uint16_t num_wqes) {
+    nvshmemi_ibgda_device_qp_t *qp, uint64_t base_wqe_idx, uint16_t num_wqes,
+    uint64_t base_slot_idx, uint64_t num_slots) {
     nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
     nvshmemi_ibgda_device_qp_management_t *mvars = &qp->mvars;
     uint64_t mask = ~((uint64_t)(state->num_requests_in_batch - 1));
 
     uint64_t new_wqe_idx = base_wqe_idx + num_wqes;
+    uint64_t new_slot_idx = (base_slot_idx + num_slots) % qp->tx_wq.sq_depth;
 
     unsigned long long int *ready_idx =
         (unsigned long long int *)(state->use_async_postsend ? qp->tx_wq.prod_idx
                                                              : &mvars->tx_wq.ready_head);
+    // TBD: no async postsend support yet
+    unsigned long long int *ready_slot =
+        (unsigned long long int *)&mvars->tx_wq.ready_prod_slot_idx;
 
     // WQE writes must be finished first.
     if (need_strong_flush)
@@ -1030,14 +980,21 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_submit_reque
 
     // Wait for prior WQE slots to be filled first.
     // They might not be post-sent yet.
-    if (need_strong_flush)
+    if (need_strong_flush) {
         while (atomicCAS(ready_idx, (unsigned long long int)base_wqe_idx,
                          (unsigned long long int)new_wqe_idx) != base_wqe_idx)
             ;  // wait here
-    else
+        while (atomicCAS(ready_slot, (unsigned long long int)base_slot_idx,
+                         (unsigned long long int)new_slot_idx) != base_slot_idx)
+            ;  // wait here
+    } else {
         while (atomicCAS_block(ready_idx, (unsigned long long int)base_wqe_idx,
                                (unsigned long long int)new_wqe_idx) != base_wqe_idx)
             ;  // wait here
+        while (atomicCAS_block(ready_slot, (unsigned long long int)base_slot_idx,
+                               (unsigned long long int)new_slot_idx) != base_slot_idx)
+            ;  // wait here
+    }
 
     IBGDA_MFENCE();
 
@@ -1050,7 +1007,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_submit_reque
             || (num_wqes >= state->num_requests_in_batch);  // The number of wqes in this submission
                                                             // reaches the threshold.
 
-        if (do_post_send) ibgda_post_send<need_strong_flush>(qp, new_wqe_idx);
+        if (do_post_send) ibgda_post_send<need_strong_flush>(qp, new_wqe_idx, new_slot_idx);
     }
 }
 
@@ -1102,80 +1059,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_get_proxy_pe(
     return pe;
 }
 
-__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint32_t ibgda_get_dct_id(int pe,
-                                                                                   int dev_idx) {
-    nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
-    uint32_t id = ibgda_get_ctaid();
-    /* There are ndcts_per_pe * state->num_devices_initialized per pe. */
-    uint32_t dct_id = (pe * state->ndcts_per_pe * state->num_devices_initialized) +
-                      (((id % state->ndcts_per_pe) * state->num_devices_initialized) + dev_idx);
-    return dct_id;
-}
-
-__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE nvshmemi_ibgda_device_dct_t *ibgda_get_dct(
-    int pe, int dev_idx) {
-    nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
-    uint32_t dct_idx = ibgda_get_dct_id(pe, dev_idx);
-
-    if (dct_idx < NVSHMEMI_IBGDA_MAX_CONST_DCTS) return &state->constmem.dcts[dct_idx];
-
-    return &state->globalmem.dcts[dct_idx - NVSHMEMI_IBGDA_MAX_CONST_DCTS];
-}
-
-__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE nvshmemi_ibgda_device_qp_t *ibgda_get_dci(
-    int pe, bool *out_shared_among_ctas) {
-    nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
-    uint32_t id;
-    uint32_t dev_offset;
-    bool shared_among_ctas = false;
-    uint32_t warpid = nvshmemi_thread_id_in_block() / nvshmemi_warp_size();
-
-    switch (state->dci_map_type) {
-        case NVSHMEMI_IBGDA_DEVICE_QP_MAP_TYPE_CTA:
-            id = ibgda_get_ctaid();
-            break;
-        case NVSHMEMI_IBGDA_DEVICE_QP_MAP_TYPE_SM:
-            id = ibgda_get_smid();
-            shared_among_ctas = true;
-            break;
-        case NVSHMEMI_IBGDA_DEVICE_QP_MAP_TYPE_WARP:
-            id = ibgda_get_ctaid() * nvshmemi_block_size() / nvshmemi_warp_size() + warpid;
-            break;
-        case NVSHMEMI_IBGDA_DEVICE_QP_MAP_TYPE_DCT: {
-            uint32_t dct_id;
-            uint32_t group_id =
-                ibgda_get_ctaid() * nvshmemi_block_size() / nvshmemi_warp_size() + warpid;
-
-            dct_id = ibgda_get_dct_id(pe, 0);
-            id = (group_id % state->num_dct_groups) * state->ndcts_per_pe *
-                     nvshmemi_device_state_d.npes * state->num_devices_initialized +
-                 dct_id * state->num_devices_initialized;
-            shared_among_ctas = true;
-            break;
-        }
-        default:
-            assert(0);
-            break;
-    }
-    dev_offset = ++state->globalmem.qp_group_switches[id % state->num_qp_groups];
-
-    /* round down */
-    id = id / state->num_devices_initialized;
-    /* add dev index */
-    id = (id * state->num_devices_initialized) + (dev_offset % state->num_devices_initialized);
-
-    uint32_t idx;
-    if (id < state->num_exclusive_dcis)
-        idx = id;
-    else {
-        idx = state->num_exclusive_dcis + (id % state->num_shared_dcis);
-        shared_among_ctas = true;
-    }
-
-    *out_shared_among_ctas = shared_among_ctas;
-    return &state->globalmem.dcis[idx];
-}
-
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE nvshmemi_ibgda_device_qp_t *ibgda_get_rc(
     int pe, bool *out_shared_among_ctas) {
     nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
@@ -1184,8 +1067,11 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE nvshmemi_ibgda_device_q
     uint32_t dev_offset;
     uint32_t warpid = nvshmemi_thread_id_in_block() / nvshmemi_warp_size();
 
+#ifdef NVSHMEM_IBGDA_USE_RC_LOOPBACK
+    // Loopback RC QP should have been created
+#else
     assert(pe != nvshmemi_device_state_d.mype);
-
+#endif
     switch (state->rc_map_type) {
         case NVSHMEMI_IBGDA_DEVICE_QP_MAP_TYPE_CTA:
             id = ibgda_get_ctaid();
@@ -1218,10 +1104,8 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE nvshmemi_ibgda_device_q
     int pe, bool *out_shared_among_ctas) {
     nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
 
-    if (ibgda_is_rc_enabled() && pe != nvshmemi_device_state_d.mype)
-        return ibgda_get_rc(pe, out_shared_among_ctas);
-    else
-        return ibgda_get_dci(pe, out_shared_among_ctas);
+    // Allow self PE QP to be retrieved
+    return ibgda_get_rc(pe, out_shared_among_ctas);
 }
 
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_get_lkey(
@@ -1307,10 +1191,13 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_get_raddr_rk
 }
 
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint64_t ibgda_reserve_wqe_slots(
-    nvshmemi_ibgda_device_qp_t *qp, unsigned long long int num_wqes, bool is_qp_shared_among_ctas) {
+    nvshmemi_ibgda_device_qp_t *qp, unsigned long long int num_wqes, bool is_qp_shared_among_ctas,
+    int wqe_size, int num_msn, int num_pkts, uint64_t *slot_idx, uint64_t *msn, uint64_t *psn) {
     nvshmemi_ibgda_device_qp_management_t *mvars = &qp->mvars;
     uint64_t wqe_idx;
 
+    global_lock_acquire<NVSHMEMI_THREADGROUP_THREAD>(&qp->mvars.resv_lock);
+    // 1. Reserve wqe_idx
 // OK to keep this conditional since we only support one build per major verion.
 #if CUDART_VERSION >= 12000
     if (is_qp_shared_among_ctas)
@@ -1328,6 +1215,20 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint64_t ibgda_reserve_
                      : "=l"(wqe_idx)
                      : "l"(&mvars->tx_wq.resv_head), "l"(num_wqes));
 #endif
+
+    // 2. Reserve slot_idx
+    *slot_idx = atomicAdd((unsigned long long int *)&mvars->tx_wq.resv_prod_slot_idx, 0);
+    atomicExch((unsigned long long int *)&mvars->tx_wq.resv_prod_slot_idx,
+               (*slot_idx + num_wqes * wqe_size) % qp->tx_wq.sq_depth);
+
+    // 3. Reserve msn and psn idx
+    *msn = atomicAdd((unsigned long long int *)&mvars->tx_wq.msn_idx, 0);
+    atomicExch((unsigned long long int *)&mvars->tx_wq.msn_idx,
+               (*msn + num_msn) % qp->msn_tbl_sz);
+    *psn = atomicAdd((unsigned long long int *)&mvars->tx_wq.psn, num_pkts);
+
+    global_lock_release<NVSHMEMI_THREADGROUP_THREAD>(&qp->mvars.resv_lock);
+
     // If last slot is available, all prior slots are also available.
     ibgda_wait_for_slot_availability(qp, wqe_idx + num_wqes);
     return wqe_idx;
@@ -1395,34 +1296,34 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE bool ibgda_can_coalesce
     return true;
 }
 
+// CST is used for GPUs which do not natively support ordering of remote writes
+// This means it'll need additional sync ops
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint64_t
-ibgda_cst(nvshmemi_ibgda_device_qp_t *dci, bool is_dci_shared_among_ctas) {
-    assert(likely(dci->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI));
+ibgda_cst(nvshmemi_ibgda_device_qp_t *qp, bool is_qp_shared_among_ctas) {
+    assert(likely(qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC));
 
-    nvshmemi_ibgda_device_dct_t *dct = ibgda_get_dct(nvshmemi_device_state_d.mype, dci->dev_idx);
-
-    uint64_t laddr = (uint64_t)dci->ibuf.buf;
-    __be32 lkey = dci->ibuf.lkey;
-
+    uint64_t laddr = (uint64_t)qp->ibuf.buf;
+    __be32 lkey = qp->ibuf.lkey;
     const int num_wqes = 1;
+    const int num_slots_per_wqe = 3;
 
-    uint64_t base_wqe_idx = ibgda_reserve_wqe_slots(dci, num_wqes, is_dci_shared_among_ctas);
-
-    void *wqe_ptrs[1];
-    wqe_ptrs[0] = ibgda_get_wqe_ptr(dci, base_wqe_idx);
+    uint64_t base_wqe_idx, base_slot_idx, base_msn_idx, base_psn;
+    base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas,
+                                           num_slots_per_wqe, 1, 1,
+                                           &base_slot_idx, &base_msn_idx, &base_psn);
 
     // DUMP OP causes the NIC to read laddr, which is always on GPU memory.
     // For CST, it is cheaper than RDMA READ.
-    ibgda_write_dump_wqe(dci, laddr, lkey, sizeof(char), base_wqe_idx, 0,
-                         wqe_ptrs);
+    ibgda_write_dump_wqe(qp, laddr, lkey, 0, base_slot_idx,
+                         BNXT_RE_WR_FLAGS_RD_FENCE);
 
     // Don't update get_head here because this is internal cst
-    if (is_dci_shared_among_ctas)
-        ibgda_submit_requests<true>(dci, base_wqe_idx, num_wqes);
+    if (is_qp_shared_among_ctas)
+        ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
     else
-        ibgda_submit_requests<false>(dci, base_wqe_idx, num_wqes);
+        ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
 
-    return ibgda_quiet(dci);
+    return ibgda_quiet(qp);
 }
 
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint64_t
@@ -1446,18 +1347,12 @@ ibgda_quiet_with_cst(nvshmemi_ibgda_device_qp_t *qp, bool is_qp_shared_among_cta
         // TODO: Change to WAIT + DUMP
         // In that case, we don't have to do quiet first
         if (get_tail < get_head) {
-            if (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) {
-                    assert(0);
-            } else {
-                // We don't have RC loopback to self.
-                // So, we grab a DCI for CST.
-                bool is_dci_shared_among_ctas;
-                nvshmemi_ibgda_device_qp_t *dci =
-                    ibgda_get_dci(nvshmemi_device_state_d.mype, &is_dci_shared_among_ctas);
-                uint64_t cst_ticket = ibgda_cst(dci, is_dci_shared_among_ctas);
-                ibgda_update_get_tail(dci, cst_ticket);
-                ibgda_update_get_tail(qp, ticket);
-            }
+            bool is_qp_shared_among_ctas;
+            nvshmemi_ibgda_device_qp_t *myqp =
+                ibgda_get_qp(nvshmemi_device_state_d.mype, &is_qp_shared_among_ctas);
+            uint64_t cst_ticket = ibgda_cst(myqp, is_qp_shared_among_ctas);
+            ibgda_update_get_tail(myqp, cst_ticket);
+            ibgda_update_get_tail(qp, ticket);
         }
     }
 
@@ -1478,7 +1373,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma_thread(
 
     int is_qp_shared_among_ctas;
     nvshmemi_ibgda_device_qp_t *qp;
-    nvshmemi_ibgda_device_dct_t *dct;
 
     if (can_coalesce_warp) {
         my_tid = nvshmemi_thread_id_in_threadgroup<NVSHMEMI_THREADGROUP_WARP>();
@@ -1493,13 +1387,10 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma_thread(
         my_tid = nvshmemi_thread_id_in_threadgroup<NVSHMEMI_THREADGROUP_THREAD>();
         tg_size = nvshmemi_threadgroup_size<NVSHMEMI_THREADGROUP_THREAD>();
     }
-    dct = ibgda_get_dct(proxy_pe, qp->dev_idx);
 
-    const bool need_additional_wqe =
-        need_immediate_cst ||
-        ((qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) && !support_half_av_seg);
-    int num_wqes_per_cmd =
-        (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) ? (support_half_av_seg ? 1 : 2) : 1;
+    const bool need_additional_wqe = need_immediate_cst;
+    int num_wqes_per_cmd = 1;
+    int num_slots_per_wqe = 3;
 
     bool did_quiet = false;
 
@@ -1531,22 +1422,27 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma_thread(
         }
 
         int num_wqes = num_wqes_per_cmd * tg_size + (need_additional_wqe ? 1 : 0);
+        int total_msn = num_wqes_per_cmd * tg_size;
+        int ppw = bnxt_re_get_pkts_per_wqe(qp, transfer_size);
+        int total_pkts = total_msn * ppw;
 
-        uint64_t base_wqe_idx;
+        uint64_t base_wqe_idx, base_slot_idx, base_msn_idx, base_psn;
 
         if (my_tid == 0) {
-            base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas);
+            base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas,
+                                            num_slots_per_wqe, total_msn, total_pkts,
+                                            &base_slot_idx, &base_msn_idx, &base_psn);
         }
-
         if (can_coalesce_warp) {
             base_wqe_idx = __shfl_sync(amask, base_wqe_idx, 0);
+            base_slot_idx = __shfl_sync(amask, base_slot_idx, 0);
+            base_msn_idx = __shfl_sync(amask, base_msn_idx, 0);
+            base_psn = __shfl_sync(amask, base_psn, 0);
         }
 
-        uint64_t my_wqe_idx = base_wqe_idx + (my_tid * num_wqes_per_cmd);
-
-        void *wqe_ptrs[2];
-        wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-        wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
+        uint64_t my_slot_idx = base_slot_idx + (my_tid * num_wqes_per_cmd * num_slots_per_wqe);
+        uint64_t my_msn_idx = base_msn_idx + (my_tid * num_wqes_per_cmd);
+        uint64_t my_psn = base_psn + (my_tid * num_wqes_per_cmd * ppw);
 
         // Generate CQE only if we create the last WQE in the group.
         // TBD - Check this
@@ -1554,14 +1450,13 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma_thread(
 
         switch (channel_op) {
             case NVSHMEMI_OP_PUT:
-                ibgda_write_rdma_write_wqe<support_half_av_seg>(qp, dct, lptr, lkey, raddr, rkey,
-                                                                transfer_size, my_wqe_idx, fm_ce_se,
-                                                                wqe_ptrs);
+                ibgda_write_rdma_write_wqe<support_half_av_seg>(qp, lptr, lkey, raddr, rkey,
+                                                    transfer_size, my_slot_idx, my_msn_idx,
+                                                    my_psn, ppw, fm_ce_se);
                 break;
             case NVSHMEMI_OP_GET:
-                ibgda_write_rdma_read_wqe<support_half_av_seg>(qp, dct, lptr, lkey, raddr, rkey,
-                                                               transfer_size, my_wqe_idx, fm_ce_se,
-                                                               wqe_ptrs);
+                ibgda_write_rdma_read_wqe<support_half_av_seg>(qp, lptr, lkey, raddr, rkey,
+                                                               transfer_size, my_slot_idx, fm_ce_se);
                 break;
             default:
 #ifdef NVSHMEM_IBGDA_DEBUG
@@ -1579,15 +1474,13 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma_thread(
                 // Enqueue CST op in the QP.  This command has NIC Fence, which
                 // waits for all prior READ/ATOMIC to finish before issuing this
                 // DUMP.
-                my_wqe_idx += num_wqes_per_cmd;
-                wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
+                my_slot_idx += num_wqes_per_cmd * num_slots_per_wqe;
                 ibgda_write_dump_wqe(qp, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sizeof(char),
-                                     my_wqe_idx, 2 << 5, wqe_ptrs);
+                                     my_slot_idx, 2 << 5);
             } else {
                 if (need_additional_wqe) {
-                    my_wqe_idx += num_wqes_per_cmd;
-                    wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-                    ibgda_write_nop_wqe(qp, my_wqe_idx, wqe_ptrs);
+                    my_slot_idx += num_wqes_per_cmd * num_slots_per_wqe;
+                    ibgda_write_nop_wqe(qp, my_slot_idx);
                 }
 
                 if (need_cst) {
@@ -1601,9 +1494,9 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma_thread(
             if (channel_op == NVSHMEMI_OP_PUT && is_data_buf_in_sysmem) __threadfence_system();
 
             if (is_qp_shared_among_ctas)
-                ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes);
+                ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
             else
-                ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes);
+                ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
         }
 
         remaining_size -= transfer_size;
@@ -1654,15 +1547,14 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma(uint64_t
 
     int is_qp_shared_among_ctas = 0;
     nvshmemi_ibgda_device_qp_t *qp;
-    nvshmemi_ibgda_device_dct_t *dct;
 
+    int num_slots_per_wqe = 0;
     int num_wqes;
     int num_wqes_per_cmd;
+    int ppw, total_msn, total_pkts;
 
-    uint64_t base_wqe_idx;
-    uint64_t my_wqe_idx;
-
-    void *wqe_ptrs[2];
+    uint64_t base_wqe_idx, base_slot_idx, base_msn_idx, base_psn;
+    uint64_t my_slot_idx, my_msn_idx, my_psn;
 
     size_t remaining_size = bytes;
 
@@ -1702,14 +1594,11 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma(uint64_t
     }
     qp = (nvshmemi_ibgda_device_qp_t *)__shfl_sync(IBGDA_FULL_WARP, (uintptr_t)qp, 0);
     is_qp_shared_among_ctas = __shfl_sync(IBGDA_FULL_WARP, is_qp_shared_among_ctas, 0);
-    dct = ibgda_get_dct(proxy_pe, qp->dev_idx);
 
-    need_additional_wqe =
-        need_immediate_cst ||
-        ((qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) && !support_half_av_seg);
+    need_additional_wqe = need_immediate_cst;
 
-    num_wqes_per_cmd =
-        (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) ? (support_half_av_seg ? 1 : 2) : 1;
+    num_wqes_per_cmd = 1;
+    num_slots_per_wqe = 3;
 
     // Calculate how many chunks we need to send.
     while (remaining_size > 0) {
@@ -1741,31 +1630,39 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma(uint64_t
     }
 
     num_wqes = num_wqes_per_cmd * chunk_idx + (need_additional_wqe ? 1 : 0);
+    ppw = bnxt_re_get_pkts_per_wqe(qp, transfer_size);
+    total_msn = num_wqes_per_cmd * chunk_idx;
+    total_pkts = total_msn * ppw;
 
     if (my_tid == 0) {
-        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas);
+        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas,
+                                            num_slots_per_wqe, total_msn, total_pkts,
+                                            &base_slot_idx, &base_msn_idx, &base_psn);
     }
 
     base_wqe_idx = __shfl_sync(IBGDA_FULL_WARP, base_wqe_idx, 0);
-    my_wqe_idx = base_wqe_idx + (my_tid * num_wqes_per_cmd);
+    base_slot_idx = __shfl_sync(IBGDA_FULL_WARP, base_slot_idx, 0);
+    base_msn_idx = __shfl_sync(IBGDA_FULL_WARP, base_msn_idx, 0);
+    base_psn = __shfl_sync(IBGDA_FULL_WARP, base_psn, 0);
+    my_slot_idx = base_slot_idx + (my_tid * num_wqes_per_cmd * num_slots_per_wqe);
+    my_msn_idx = base_msn_idx + (my_tid * num_wqes_per_cmd);
+    my_psn = base_psn + (my_tid * num_wqes_per_cmd * ppw);
 
     // Generate CQE only if we create the last WQE in the group.
     fm_ce_se = 0;
 
     if (my_tid < chunk_idx) {
-        wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-        wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
-
         switch (channel_op) {
             case NVSHMEMI_OP_PUT:
-                ibgda_write_rdma_write_wqe<support_half_av_seg>(qp, dct, my_laddr, my_lkey,
-                                                                my_raddr, my_rkey, my_transfer_size,
-                                                                my_wqe_idx, fm_ce_se, wqe_ptrs);
+                ibgda_write_rdma_write_wqe<support_half_av_seg>(qp, my_laddr, my_lkey,
+                                                  my_raddr, my_rkey, my_transfer_size,
+                                                  my_slot_idx, my_msn_idx, my_psn,
+                                                  ppw, fm_ce_se);
                 break;
             case NVSHMEMI_OP_GET:
-                ibgda_write_rdma_read_wqe<support_half_av_seg>(qp, dct, my_laddr, my_lkey, my_raddr,
+                ibgda_write_rdma_read_wqe<support_half_av_seg>(qp, my_laddr, my_lkey, my_raddr,
                                                                my_rkey, my_transfer_size,
-                                                               my_wqe_idx, fm_ce_se, wqe_ptrs);
+                                                               my_slot_idx, fm_ce_se);
                 break;
             default:
 #ifdef NVSHMEM_IBGDA_DEBUG
@@ -1779,18 +1676,16 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma(uint64_t
 
     if (my_tid == chunk_idx - 1) {
         if (need_immediate_cst) {
-            my_wqe_idx += num_wqes_per_cmd;
-            wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
+            my_slot_idx += num_wqes_per_cmd * num_slots_per_wqe;
             // Enqueue CST op in the QP.  This command has NIC Fence, which
             // waits for all prior READ/ATOMIC to finish before issuing this
             // DUMP.
             ibgda_write_dump_wqe(qp, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sizeof(char),
-                                 my_wqe_idx, 2 << 5, wqe_ptrs);
+                                 my_slot_idx, BNXT_RE_WR_FLAGS_RD_FENCE);
         } else {
             if (need_additional_wqe) {
-                my_wqe_idx += num_wqes_per_cmd;
-                wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-                ibgda_write_nop_wqe(qp, my_wqe_idx, wqe_ptrs);
+                my_slot_idx += num_wqes_per_cmd * num_slots_per_wqe;
+                ibgda_write_nop_wqe(qp, my_slot_idx);
             }
 
             if (need_cst) {
@@ -1805,9 +1700,9 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma(uint64_t
         if (channel_op == NVSHMEMI_OP_PUT && is_data_buf_in_sysmem) __threadfence_system();
 
         if (is_qp_shared_among_ctas)
-            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes);
+            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
         else
-            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes);
+            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
 
         if (!nbi) {
             // CST, if required, has already been enqueued. We simply need to
@@ -1840,7 +1735,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_rma
     int proxy_pe = ibgda_get_proxy_pe(dst_pe);
     int is_qp_shared_among_ctas;
     nvshmemi_ibgda_device_qp_t *qp;
-    nvshmemi_ibgda_device_dct_t *dct;
 
     nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
 
@@ -1857,7 +1751,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_rma
         my_tid = nvshmemi_thread_id_in_threadgroup<NVSHMEMI_THREADGROUP_THREAD>();
         tg_size = nvshmemi_threadgroup_size<NVSHMEMI_THREADGROUP_THREAD>();
     }
-    dct = ibgda_get_dct(proxy_pe, qp->dev_idx);
 
     __be32 rkey;
     uint64_t raddr;
@@ -1868,80 +1761,72 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_rma
     // With proper alignment (requirement of NVSHMEM), one element cannot span multiple chunks.
     assert(rchunk_size >= sizeof(T));
 
+    int num_slots_per_wqe = 3;
     int num_wqes_per_cmd;
     int num_wqes;
+    int total_msn, total_pkts;
 
     bool need_additional_wqe = false;
 
     if (can_combine_data) {
-        if (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC) {
-            num_wqes_per_cmd =
-                ibgda_get_num_wqes_in_inl_combine_warp<T, NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC>();
-        } else if (sizeof(T) == 8) {
-            num_wqes_per_cmd =
-                2 * ibgda_get_num_wqes_in_inl_combine_warp<uint32_t,
-                                                           NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI>();
-        } else {
-            num_wqes_per_cmd =
-                ibgda_get_num_wqes_in_inl_combine_warp<T, NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI>();
-        }
+        num_wqes_per_cmd =
+            ibgda_get_num_wqes_in_inl_combine_warp<T, NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC>();
         num_wqes = num_wqes_per_cmd;
     } else {
-        num_wqes_per_cmd =
-            (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) ? (support_half_av_seg ? 1 : 2) : 1;
+        num_wqes_per_cmd = 1;
         num_wqes = num_wqes_per_cmd * tg_size;
     }
+    total_msn = num_wqes;
+    total_pkts = total_msn * num_wqes_per_cmd; // 1 pkt per inline wqe
 
+    // additional nop wqe doesn't need MSN entry
     if (!can_combine_data && num_wqes_per_cmd > 1) {
         ++num_wqes;
         need_additional_wqe = true;
     }
 
-    uint64_t base_wqe_idx;
+    uint64_t base_wqe_idx = 0, base_slot_idx = 0, base_msn_idx = 0, base_psn = 0;
 
     if (my_tid == 0) {
-        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas);
+        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas,
+                                               num_slots_per_wqe, total_msn, total_pkts,
+                                               &base_slot_idx, &base_msn_idx, &base_psn);
     }
 
     if (is_full_warp) {
+        // Sync the following base variables for all threads within a WARP
         base_wqe_idx = __shfl_sync(IBGDA_FULL_WARP, base_wqe_idx, 0);
+        base_slot_idx = __shfl_sync(IBGDA_FULL_WARP, base_slot_idx, 0);
+        base_msn_idx = __shfl_sync(IBGDA_FULL_WARP, base_msn_idx, 0);
+        base_psn = __shfl_sync(IBGDA_FULL_WARP, base_psn, 0);
     }
 
     // Generate CQE only if we create the last WQE in the group.
     uint8_t fm_ce_se = 0;
 
-    uint64_t my_wqe_idx =
-        can_combine_data ? base_wqe_idx : base_wqe_idx + (my_tid * num_wqes_per_cmd);
+    uint64_t my_slot_idx = base_slot_idx + (my_tid * num_wqes_per_cmd * num_slots_per_wqe);
+    uint64_t my_msn_idx = base_msn_idx + (my_tid * num_wqes_per_cmd);
+    uint64_t my_psn = base_psn + (my_tid * num_wqes_per_cmd * 1);   // 1 pkt per wqe
 
-    void *wqe_ptrs[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        wqe_ptrs[i] = ibgda_get_wqe_ptr(qp, my_wqe_idx + i);
-    }
-
-    if (can_combine_data && sizeof(T) == 8 && qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI)
-        ibgda_write_rdma_write_inl_wqe_combine_warp_for_dci_8B<T>(qp, dct, value, raddr, rkey,
-                                                                  my_wqe_idx, my_tid, wqe_ptrs);
-    else if (can_combine_data)
-        ibgda_write_rdma_write_inl_wqe_combine_warp<T>(qp, dct, value, raddr, rkey, my_wqe_idx,
-                                                       my_tid, wqe_ptrs);
+    if (can_combine_data)
+        ibgda_write_rdma_write_inl_wqe_combine_warp<T>(qp, value, raddr, rkey, my_slot_idx,
+                                                       my_tid);
     else
-        ibgda_write_rdma_write_inl_wqe<support_half_av_seg>(qp, dct, &value, raddr, rkey, sizeof(T),
-                                                            my_wqe_idx, fm_ce_se, wqe_ptrs);
+        ibgda_write_rdma_write_inl_wqe<support_half_av_seg>(qp, &value, raddr, rkey, sizeof(T),
+                                                    my_slot_idx, my_msn_idx, my_psn, fm_ce_se);
 
     if (is_full_warp) nvshmemi_warp_sync();
 
     if (my_tid == tg_size - 1) {
         if (need_additional_wqe) {
-            my_wqe_idx += num_wqes_per_cmd;
-            wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-            ibgda_write_nop_wqe(qp, my_wqe_idx, wqe_ptrs);
+            my_slot_idx += num_wqes_per_cmd * num_slots_per_wqe;
+            ibgda_write_nop_wqe(qp, my_slot_idx);
         }
 
         if (is_qp_shared_among_ctas)
-            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes);
+            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
         else
-            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes);
+            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
     }
 
     // TBD - Review and conclude later.
@@ -1997,7 +1882,137 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE T nvshmemi_ibgda_rma_g_impl(void *rptr,
                                                                      int proxy_pe) {
     assert(0);
     return false;
-    // TBD -
+#if 0
+    unsigned int amask = __activemask();
+    int my_tid;
+    int tg_size;
+
+    nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
+    const bool need_cst = !state->may_skip_cst;
+
+    uint64_t base_wqe_idx;
+    uint64_t base_ibuf_idx;
+
+    T ret;
+
+    int is_qp_shared_among_ctas;
+    nvshmemi_ibgda_device_qp_t *qp;
+
+    __be32 rkey;
+    uint64_t raddr;
+    size_t rchunk_size;
+
+    bool can_coalesce_warp = ibgda_can_coalesce_warp_pe(amask, proxy_pe);
+    bool can_combine_data = false;
+    int pred_contiguous = 0;
+    int pred_rkey = 0;
+
+    if (can_coalesce_warp) {
+        my_tid = nvshmemi_thread_id_in_threadgroup<NVSHMEMI_THREADGROUP_WARP>();
+        tg_size = nvshmemi_threadgroup_size<NVSHMEMI_THREADGROUP_WARP>();
+        if (my_tid == 0) {
+            qp = ibgda_get_qp(proxy_pe, (bool *)&is_qp_shared_among_ctas);
+        }
+        qp = (nvshmemi_ibgda_device_qp_t *)__shfl_sync(IBGDA_FULL_WARP, (uintptr_t)qp, 0);
+        is_qp_shared_among_ctas = __shfl_sync(IBGDA_FULL_WARP, is_qp_shared_among_ctas, 0);
+        ibgda_get_raddr_rkey((uint64_t)rptr, dst_pe, proxy_pe, &raddr, &rkey, &rchunk_size,
+                             qp->dev_idx);
+
+        __match_all_sync(IBGDA_FULL_WARP, (uintptr_t)(rptr) - (my_tid * sizeof(T)),
+                         &pred_contiguous);
+        __match_all_sync(IBGDA_FULL_WARP, rkey, &pred_rkey);
+        can_combine_data = (pred_contiguous && pred_rkey);
+    } else {
+        my_tid = nvshmemi_thread_id_in_threadgroup<NVSHMEMI_THREADGROUP_THREAD>();
+        tg_size = nvshmemi_threadgroup_size<NVSHMEMI_THREADGROUP_THREAD>();
+        qp = ibgda_get_qp(proxy_pe, (bool *)&is_qp_shared_among_ctas);
+        ibgda_get_raddr_rkey((uint64_t)rptr, dst_pe, proxy_pe, &raddr, &rkey, &rchunk_size,
+                             qp->dev_idx);
+    }
+
+    const bool need_additional_wqe = need_cst;
+
+    int num_wqes_per_cmd = 1;
+
+    int num_wqes = (can_combine_data ? num_wqes_per_cmd : num_wqes_per_cmd * tg_size) +
+                   (need_additional_wqe ? 1 : 0);
+
+    int num_ibuf_slots = can_coalesce_warp ? 1 : tg_size;
+
+    if (my_tid == 0) {
+        base_ibuf_idx = ibgda_reserve_ibuf_slots(qp, num_ibuf_slots);
+        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas);
+    }
+
+    if (can_coalesce_warp) {
+        base_wqe_idx = __shfl_sync(amask, base_wqe_idx, 0);
+        base_ibuf_idx = __shfl_sync(amask, base_ibuf_idx, 0);
+    }
+
+    uint64_t my_wqe_idx =
+        can_combine_data ? base_wqe_idx : base_wqe_idx + (my_tid * num_wqes_per_cmd);
+    uint64_t my_ibuf_idx = can_coalesce_warp ? base_ibuf_idx : base_ibuf_idx + my_tid;
+
+    void *wqe_ptrs[2];
+    wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
+    wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
+
+    uint64_t laddr =
+        ibgda_get_ibuf_addr(qp, my_ibuf_idx) + (can_coalesce_warp ? my_tid * sizeof(T) : 0);
+    __be32 lkey = qp->ibuf.lkey;
+
+    // Generate CQE only if we create the last WQE in the group.
+    uint8_t fm_ce_se = (!need_additional_wqe && ((can_combine_data && (my_tid == 0)) ||
+                                                 (!can_combine_data && (my_tid == tg_size - 1))))
+                           ? BNXT_RE_WR_FLAGS_SIGNALED
+                           : 0;
+
+    if (!can_combine_data) {
+        ibgda_write_rdma_read_wqe<support_half_av_seg>(qp, laddr, lkey, raddr, rkey, sizeof(T),
+                                                       my_wqe_idx, fm_ce_se, wqe_ptrs);
+
+    } else if (my_tid == 0) {
+        ibgda_write_rdma_read_wqe<support_half_av_seg>(
+            qp, laddr, lkey, raddr, rkey, sizeof(T) * tg_size, my_wqe_idx, fm_ce_se, wqe_ptrs);
+    }
+
+    if (can_coalesce_warp) nvshmemi_warp_sync();
+
+    if (need_additional_wqe && (my_tid == (tg_size - 1))) {
+        my_wqe_idx += num_wqes_per_cmd;
+        wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
+        fm_ce_se = BNXT_RE_WR_FLAGS_SIGNALED;
+
+        if (need_cst)
+            // Enqueue CST op in the QP.  This command has NIC Fence, which
+            // waits for all prior READ/ATOMIC to finish before issuing this
+            // DUMP.
+            ibgda_write_dump_wqe(qp, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sizeof(char),
+                                 my_wqe_idx, BNXT_RE_WR_FLAGS_RD_FENCE, wqe_ptrs);
+        else
+            ibgda_write_nop_wqe(qp, my_wqe_idx, wqe_ptrs);
+    }
+    if (fm_ce_se > 0) {
+        if (is_qp_shared_among_ctas)
+            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes);
+        else
+            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes);
+
+        ibgda_quiet(qp);
+    }
+
+    if (can_coalesce_warp) nvshmemi_warp_sync();
+
+    ret = READ_ONCE(*(T *)laddr);
+
+    if (can_coalesce_warp) nvshmemi_warp_sync();
+
+    if (my_tid == tg_size - 1) ibgda_release_ibuf(qp, base_ibuf_idx, num_ibuf_slots);
+
+    if (can_coalesce_warp) nvshmemi_warp_sync();
+
+    return ret;
+#endif
 }
 
 template <typename T>
@@ -2082,7 +2097,6 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_amo_nonfetch_impl(v
 
     int is_qp_shared_among_ctas;
     nvshmemi_ibgda_device_qp_t *qp;
-    nvshmemi_ibgda_device_dct_t *dct;
 
     __be32 rkey;
     uint64_t raddr;
@@ -2103,7 +2117,6 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_amo_nonfetch_impl(v
         tg_size = nvshmemi_threadgroup_size<NVSHMEMI_THREADGROUP_THREAD>();
         qp = ibgda_get_qp(pe, (bool *)&is_qp_shared_among_ctas);
     }
-    dct = ibgda_get_dct(pe, qp->dev_idx);
     ibgda_get_raddr_rkey((uint64_t)rptr, pe, pe, &raddr, &rkey, &rchunk_size, qp->dev_idx);
 
     int num_wqes_per_cmd = ibgda_get_num_wqes_in_atomic<T>(op, qp->qp_type);
@@ -2111,38 +2124,44 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_amo_nonfetch_impl(v
     const bool need_additional_wqe = (num_wqes_per_cmd > 1);
 
     int num_wqes = num_wqes_per_cmd * tg_size + (need_additional_wqe ? 1 : 0);
+    int num_slots_per_wqe = 3;
 
-    uint64_t base_wqe_idx;
+    uint64_t base_wqe_idx, base_slot_idx, base_msn_idx, base_psn;
 
-    if (my_tid == 0) base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas);
+    if (my_tid == 0) {
+        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas,
+                                               num_slots_per_wqe, 1, &base_slot_idx,
+                                               &base_msn_idx, &base_psn);
+    }
 
-    if (can_coalesce_warp) base_wqe_idx = __shfl_sync(amask, base_wqe_idx, 0);
+    if (can_coalesce_warp) {
+        base_wqe_idx = __shfl_sync(amask, base_wqe_idx, 0);
+        base_slot_idx = __shfl_sync(amask, base_slot_idx, 0);
+        base_msn_idx = __shfl_sync(amask, base_msn_idx, 0);
+        base_psn = __shfl_sync(amask, base_psn, 0);
+    }
 
-    uint64_t my_wqe_idx = base_wqe_idx + (my_tid * num_wqes_per_cmd);
-
-    void *wqe_ptrs[2];
-    wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-    wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
-
+    uint64_t my_slot_idx = base_slot_idx + (my_tid * num_wqes_per_cmd * num_slots_per_wqe);
+    uint64_t my_msn_idx = base_msn_idx + (my_tid * num_wqes_per_cmd);
+    uint64_t my_psn = base_slot_idx + (my_tid * num_wqes_per_cmd * 1);  // 1 pkt per wqe
     uint8_t fm_ce_se = 0;
 
-    ibgda_write_atomic_wqe<support_half_av_seg>(qp, dct, &value, NULL, (uint64_t)qp->ibuf.buf,
-                                                qp->ibuf.lkey, raddr, rkey, sizeof(T), my_wqe_idx,
-                                                op, fm_ce_se, wqe_ptrs);
+    ibgda_write_atomic_wqe<support_half_av_seg>(qp, &value, NULL, (uint64_t)qp->ibuf.buf,
+                                                qp->ibuf.lkey, raddr, rkey, sizeof(T), my_slot_idx,
+                                                op, fm_ce_se);
 
     if (can_coalesce_warp) nvshmemi_warp_sync();
 
     if (my_tid == tg_size - 1) {
         if (need_additional_wqe) {
-            my_wqe_idx += num_wqes_per_cmd;
-            wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-            ibgda_write_nop_wqe(qp, my_wqe_idx, wqe_ptrs);
+            my_slot_idx += num_wqes_per_cmd * num_slots_per_wqe;
+            ibgda_write_nop_wqe(qp, my_slot_idx);
         }
 
         if (is_qp_shared_among_ctas)
-            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes);
+            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
         else
-            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes);
+            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
     }
 
     if (can_coalesce_warp) nvshmemi_warp_sync();
@@ -2178,7 +2197,6 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE T nvshmemi_ibgda_amo_fetch_impl(void *r
 
     int is_qp_shared_among_ctas;
     nvshmemi_ibgda_device_qp_t *qp;
-    nvshmemi_ibgda_device_dct_t *dct;
 
     __be32 rkey;
     uint64_t raddr;
@@ -2199,7 +2217,6 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE T nvshmemi_ibgda_amo_fetch_impl(void *r
         tg_size = nvshmemi_threadgroup_size<NVSHMEMI_THREADGROUP_THREAD>();
         qp = ibgda_get_qp(pe, (bool *)&is_qp_shared_among_ctas);
     }
-    dct = ibgda_get_dct(pe, qp->dev_idx);
     ibgda_get_raddr_rkey((uint64_t)rptr, pe, pe, &raddr, &rkey, &rchunk_size, qp->dev_idx);
 
     int num_wqes_per_cmd = ibgda_get_num_wqes_in_atomic<T>(op, qp->qp_type);
@@ -2207,56 +2224,57 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE T nvshmemi_ibgda_amo_fetch_impl(void *r
     const bool need_additional_wqe = (num_wqes_per_cmd > 1) || need_cst;
 
     int num_wqes = num_wqes_per_cmd * tg_size + (need_additional_wqe ? 1 : 0);
+    int total_msn = num_wqes_per_cmd * tg_size;
+    int ppw = 1;    // 1 pkt per atomic wqe
+    int total_pkts = total_msn * ppw;
+    int num_slots_per_wqe = 3;
 
-    uint64_t base_wqe_idx;
     uint64_t base_ibuf_idx;
+    uint64_t base_wqe_idx, base_slot_idx, base_msn_idx, base_psn;
 
     if (my_tid == 0) {
         base_ibuf_idx = ibgda_reserve_ibuf_slots(qp, tg_size);
-        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas);
+        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas,
+                                            num_slots_per_wqe, total_msn, total_pkts,
+                                            &base_slot_idx, &base_msn_idx, &base_psn);
     }
 
     if (can_coalesce_warp) {
         base_wqe_idx = __shfl_sync(amask, base_wqe_idx, 0);
         base_ibuf_idx = __shfl_sync(amask, base_ibuf_idx, 0);
+        base_slot_idx = __shfl_sync(amask, base_slot_idx, 0);
+        base_msn_idx = __shfl_sync(amask, base_msn_idx, 0);
+        base_psn = __shfl_sync(amask, base_psn, 0);
     }
 
-    uint64_t my_wqe_idx = base_wqe_idx + (my_tid * num_wqes_per_cmd);
     uint64_t my_ibuf_idx = base_ibuf_idx + my_tid;
-
+    uint64_t my_slot_idx = base_slot_idx + (my_tid * num_wqes_per_cmd * num_slots_per_wqe);
     uint64_t laddr = ibgda_get_ibuf_addr(qp, my_ibuf_idx);
     __be32 lkey = qp->ibuf.lkey;
-
-    void *wqe_ptrs[2];
-    wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-    wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
-
     uint8_t fm_ce_se = 0;
 
-    ibgda_write_atomic_wqe<support_half_av_seg>(qp, dct, &value, &compare, laddr, lkey, raddr, rkey,
-                                                sizeof(T), my_wqe_idx, op, fm_ce_se, wqe_ptrs);
+    ibgda_write_atomic_wqe<support_half_av_seg>(qp, &value, &compare, laddr, lkey, raddr, rkey,
+                                                sizeof(T), my_slot_idx, op, fm_ce_se);
 
     if (can_coalesce_warp) nvshmemi_warp_sync();
 
     if (my_tid == tg_size - 1) {
         if (need_additional_wqe) {
-            my_wqe_idx += num_wqes_per_cmd;
-            wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-
+            my_slot_idx += num_wqes_per_cmd * num_slots_per_wqe;
             if (need_cst)
                 // Enqueue CST op in the QP.  This command has NIC Fence, which
                 // waits for all prior READ/ATOMIC to finish before issuing this
                 // DUMP.
                 ibgda_write_dump_wqe(qp, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sizeof(char),
-                                     my_wqe_idx, 2 << 5, wqe_ptrs);
+                                     my_slot_idx, 2 << 5);
             else
-                ibgda_write_nop_wqe(qp, my_wqe_idx, wqe_ptrs);
+                ibgda_write_nop_wqe(qp, my_slot_idx);
         }
 
         if (is_qp_shared_among_ctas)
-            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes);
+            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
         else
-            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes);
+            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
 
         ibgda_quiet(qp);
     }
@@ -2299,7 +2317,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
     int pe) {
     nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
     nvshmemi_ibgda_device_qp_t *qp;
-    nvshmemi_ibgda_device_dct_t *dct;
     size_t lchunk_size;
     size_t rchunk_size;
     size_t sig_rchunk_size;
@@ -2330,7 +2347,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
         tg_size = nvshmemi_threadgroup_size<NVSHMEMI_THREADGROUP_THREAD>();
         qp = ibgda_get_qp(pe, (bool *)&is_qp_shared_among_ctas);
     }
-    dct = ibgda_get_dct(pe, qp->dev_idx);
     ibgda_get_lkey((uint64_t)lptr, &lkey, &lchunk_size, &is_data_buf_in_sysmem, qp->dev_idx);
     ibgda_get_raddr_rkey((uint64_t)rptr, pe, pe, &raddr, &rkey, &rchunk_size, qp->dev_idx);
     ibgda_get_raddr_rkey((uint64_t)sig_rptr, pe, pe, &sig_raddr, &sig_rkey, &sig_rchunk_size,
@@ -2339,11 +2355,13 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
     const int num_atomic_wqes_per_cmd = ibgda_get_num_wqes_in_atomic<uint64_t>(sig_op, qp->qp_type);
     const bool need_additional_wqe = (num_atomic_wqes_per_cmd > 1);
     int num_wqes;
+    int num_slots_per_wqe = 3;
     uint8_t fm_ce_se;
 
     size_t transfer_size = ibgda_cal_transfer_size(bytes, lchunk_size, rchunk_size);
-    uint64_t base_wqe_idx;
-    uint64_t my_wqe_idx;
+    uint64_t base_wqe_idx, base_slot_idx, base_msn_idx, base_psn;
+    uint64_t my_slot_idx, my_msn_idx, my_psn;
+    int ppw, total_msn, total_pkts;
 
     if (transfer_size == bytes) {
         amask = __activemask();
@@ -2356,55 +2374,58 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
             tg_size = nvshmemi_threadgroup_size<NVSHMEMI_THREADGROUP_THREAD>();
         }
 
-        int num_rdma_write_wqes_per_cmd =
-            (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) ? (support_half_av_seg ? 1 : 2) : 1;
+        int num_rdma_write_wqes_per_cmd = 1;
 
         int num_wqes_per_cmd = num_rdma_write_wqes_per_cmd + num_atomic_wqes_per_cmd;
         num_wqes = num_wqes_per_cmd * tg_size + (need_additional_wqe ? 1 : 0);
+        ppw = bnxt_re_get_pkts_per_wqe(qp, transfer_size);
+        total_msn = num_wqes_per_cmd * tg_size;
+        total_pkts = total_msn * ppw;
 
         if (my_tid == 0) {
-            base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas);
+            base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas,
+                                                   num_slots_per_wqe, total_msn, total_pkts,
+                                                   &base_slot_idx, &base_msn_idx, &base_psn);
         }
 
         if (can_coalesce_warp) {
             base_wqe_idx = __shfl_sync(amask, base_wqe_idx, 0);
+            base_slot_idx = __shfl_sync(amask, base_slot_idx, 0);
+            base_msn_idx = __shfl_sync(amask, base_msn_idx, 0);
+            base_psn = __shfl_sync(amask, base_psn, 0);
         }
 
-        my_wqe_idx = base_wqe_idx + (my_tid * num_wqes_per_cmd);
+        my_slot_idx = base_slot_idx + (my_tid * num_wqes_per_cmd * num_slots_per_wqe);
+        my_msn_idx = base_msn_idx + (my_tid * num_wqes_per_cmd);
+        my_psn = base_psn + (my_tid * num_wqes_per_cmd * ppw);
 
-        void *wqe_ptrs[4];
-        wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-        wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
-        wqe_ptrs[2] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 2);
-        wqe_ptrs[3] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 3);
-
-        ibgda_write_rdma_write_wqe<support_half_av_seg>(qp, dct, (uint64_t)lptr, lkey, raddr, rkey,
-                                                        bytes, my_wqe_idx, 0, wqe_ptrs);
+        ibgda_write_rdma_write_wqe<support_half_av_seg>(qp, (uint64_t)lptr, lkey, raddr, rkey,
+                                                        bytes, my_slot_idx, my_msn_idx, my_psn,
+                                                        ppw, 0);
 
         fm_ce_se = 0;
 
+        //TBD: atomic wqe posted without reserve?
         ibgda_write_atomic_wqe<support_half_av_seg>(
-            qp, dct, &signal, NULL, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sig_raddr, sig_rkey,
-            sizeof(signal), my_wqe_idx + num_rdma_write_wqes_per_cmd, sig_op, fm_ce_se,
-            &wqe_ptrs[num_rdma_write_wqes_per_cmd]);
-
+            qp, &signal, NULL, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sig_raddr, sig_rkey,
+            sizeof(signal), my_slot_idx + num_rdma_write_wqes_per_cmd * num_slots_per_wqe,
+            sig_op, fm_ce_se);
         if (can_coalesce_warp) {
             nvshmemi_warp_sync();
         }
 
         if (my_tid == tg_size - 1) {
             if (need_additional_wqe) {
-                my_wqe_idx += num_wqes_per_cmd;
-                wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-                ibgda_write_nop_wqe(qp, my_wqe_idx, wqe_ptrs);
+                my_slot_idx += num_wqes_per_cmd * num_slots_per_wqe;
+                ibgda_write_nop_wqe(qp, my_slot_idx);
             }
 
             // Require membar.sys to push data buffer to the point of consistency.
             if (is_data_buf_in_sysmem) __threadfence_system();
             if (is_qp_shared_among_ctas)
-                ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes);
+                ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
             else
-                ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes);
+                ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
 
             if (!is_nbi) {
                 ibgda_quiet(qp);
@@ -2419,30 +2440,31 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
             (uintptr_t)rptr, (uintptr_t)lptr, bytes, pe, pe);
 
         num_wqes = num_atomic_wqes_per_cmd + (need_additional_wqe ? 1 : 0);
+        ppw = 1;
+        total_msn = num_atomic_wqes_per_cmd;
+        total_pkts = total_msn * ppw;
 
-        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas);
-        my_wqe_idx = base_wqe_idx;
-
-        void *wqe_ptrs[2];
-        wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-        wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
+        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas,
+                                               num_slots_per_wqe, total_msn, total_pkts,
+                                               &base_slot_idx, &base_msn_idx, &base_psn);
+        my_slot_idx = base_slot_idx;
+        my_msn_idx = base_msn_idx;
+        my_psn = base_psn;
 
         fm_ce_se = 0;
 
         ibgda_write_atomic_wqe<support_half_av_seg>(
-            qp, dct, &signal, NULL, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sig_raddr, sig_rkey,
-            sizeof(signal), my_wqe_idx, sig_op, fm_ce_se, wqe_ptrs);
+            qp, &signal, NULL, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sig_raddr, sig_rkey,
+            sizeof(signal), my_slot_idx, sig_op, fm_ce_se);
 
         if (need_additional_wqe) {
-            my_wqe_idx += num_atomic_wqes_per_cmd;
-            wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-            ibgda_write_nop_wqe(qp, my_wqe_idx, wqe_ptrs);
+            my_slot_idx += num_atomic_wqes_per_cmd * num_slots_per_wqe;
+            ibgda_write_nop_wqe(qp, my_slot_idx);
         }
-
         if (is_qp_shared_among_ctas)
-            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes);
+            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
         else
-            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes);
+            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
 
         if (!is_nbi) {
             ibgda_quiet(qp);
@@ -2470,18 +2492,17 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
 
     int is_qp_shared_among_ctas;
     nvshmemi_ibgda_device_qp_t *qp;
-    nvshmemi_ibgda_device_dct_t *dct;
 
     int num_rdma_write_wqes_per_cmd;
     int num_atomic_wqes_per_cmd;
     bool need_additional_wqe;
 
     int num_wqes;
+    int num_slots_per_wqe = 3;
+    int ppw, total_msn, total_pkts;
 
-    uint64_t base_wqe_idx;
-    uint64_t my_wqe_idx;
-
-    void *wqe_ptrs[2];
+    uint64_t base_wqe_idx, base_slot_idx, base_msn_idx, base_psn;
+    uint64_t my_slot_idx, my_msn_idx, my_psn;
 
     size_t remaining_size = bytes;
 
@@ -2518,13 +2539,10 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
     }
     qp = (nvshmemi_ibgda_device_qp_t *)__shfl_sync(IBGDA_FULL_WARP, (uintptr_t)qp, 0);
     is_qp_shared_among_ctas = __shfl_sync(IBGDA_FULL_WARP, is_qp_shared_among_ctas, 0);
-    dct = ibgda_get_dct(pe, qp->dev_idx);
 
-    num_rdma_write_wqes_per_cmd =
-        (qp->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI) ? (support_half_av_seg ? 1 : 2) : 1;
+    num_rdma_write_wqes_per_cmd = 1;
 
     num_atomic_wqes_per_cmd = ibgda_get_num_wqes_in_atomic<uint64_t>(sig_op, qp->qp_type);
-
     need_additional_wqe = (num_atomic_wqes_per_cmd > 1);
 
     // Calculate how many chunks we need to send.
@@ -2557,23 +2575,31 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
         goto out;
     }
 
-    num_wqes = num_rdma_write_wqes_per_cmd * chunk_idx + num_atomic_wqes_per_cmd +
-               (need_additional_wqe ? 1 : 0);
-
+    ppw = bnxt_re_get_pkts_per_wqe(qp, transfer_size);
+    num_wqes = num_rdma_write_wqes_per_cmd * chunk_idx;
+    total_msn = num_wqes;
+    total_pkts = total_msn * ppw;
+    num_wqes += num_atomic_wqes_per_cmd + (need_additional_wqe ? 1 : 0);
+    total_msn += num_atomic_wqes_per_cmd;
+    total_pkts += num_atomic_wqes_per_cmd * 1; // 1 pkt per atomic wqe
     if (my_tid == 0) {
-        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas);
+        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas,
+                                               num_slots_per_wqe, total_msn, total_pkts,
+                                               &base_slot_idx, &base_msn_idx, &base_psn);
     }
 
     base_wqe_idx = __shfl_sync(IBGDA_FULL_WARP, base_wqe_idx, 0);
-    my_wqe_idx = base_wqe_idx + (my_tid * num_rdma_write_wqes_per_cmd);
-
-    wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-    wqe_ptrs[1] = ibgda_get_wqe_ptr(qp, my_wqe_idx + 1);
+    base_slot_idx = __shfl_sync(IBGDA_FULL_WARP, base_slot_idx, 0);
+    base_msn_idx = __shfl_sync(IBGDA_FULL_WARP, base_msn_idx, 0);
+    base_psn = __shfl_sync(IBGDA_FULL_WARP, base_psn, 0);
+    my_slot_idx = base_slot_idx + (my_tid * num_rdma_write_wqes_per_cmd * num_slots_per_wqe);
+    my_msn_idx = base_msn_idx + (my_tid * num_rdma_write_wqes_per_cmd);
+    my_psn = base_psn + (my_tid * num_rdma_write_wqes_per_cmd * ppw);
 
     if (my_tid < chunk_idx) {
-        ibgda_write_rdma_write_wqe<support_half_av_seg>(qp, dct, my_laddr, my_lkey, my_raddr,
-                                                        my_rkey, my_transfer_size, my_wqe_idx, 0,
-                                                        wqe_ptrs);
+        ibgda_write_rdma_write_wqe<support_half_av_seg>(qp, my_laddr, my_lkey, my_raddr,
+                                                    my_rkey, my_transfer_size, my_slot_idx,
+                                                    my_msn_idx, my_psn, ppw, 0);
     } else if (my_tid == chunk_idx) {
         __be32 sig_rkey;
         uint64_t sig_raddr;
@@ -2584,13 +2610,12 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
         uint8_t fm_ce_se = 0;
 
         ibgda_write_atomic_wqe<support_half_av_seg>(
-            qp, dct, &signal, NULL, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sig_raddr, sig_rkey,
-            sizeof(signal), my_wqe_idx, sig_op, fm_ce_se, wqe_ptrs);
+            qp, &signal, NULL, (uint64_t)qp->ibuf.buf, qp->ibuf.lkey, sig_raddr, sig_rkey,
+            sizeof(signal), my_slot_idx, sig_op, fm_ce_se);
 
         if (need_additional_wqe) {
-            my_wqe_idx += num_atomic_wqes_per_cmd;
-            wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-            ibgda_write_nop_wqe(qp, my_wqe_idx, wqe_ptrs);
+            my_slot_idx += num_atomic_wqes_per_cmd * num_slots_per_wqe;
+            ibgda_write_nop_wqe(qp, my_slot_idx);
         }
     }
 
@@ -2601,9 +2626,9 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_put
         if (is_data_buf_in_sysmem) __threadfence_system();
 
         if (is_qp_shared_among_ctas)
-            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes);
+            ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
         else
-            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes);
+            ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes, base_slot_idx, num_wqes * num_slots_per_wqe);
 
         if (!is_nbi) {
             ibgda_quiet(qp);
@@ -2652,7 +2677,6 @@ template <threadgroup_t SCOPE>
 __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_quiet() {
     nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
     nvshmemi_ibgda_device_qp_t *qp;
-    uint32_t ndcis = state->num_shared_dcis + state->num_exclusive_dcis;
     uint32_t nrcs =
         state->num_rc_per_pe * nvshmemi_device_state_d.npes * state->num_devices_initialized;
     uint32_t index_in_scope = nvshmemi_thread_id_in_threadgroup<SCOPE>();
@@ -2662,15 +2686,19 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_quiet() {
         scope_size > IBGDA_MAX_THREADS_PER_QUIET ? IBGDA_MAX_THREADS_PER_QUIET : scope_size;
 
     if (index_in_scope < scope_size) {
-        for (uint32_t i = index_in_scope; i < ndcis; i += scope_size) {
-            qp = &state->globalmem.dcis[i];
-            ibgda_quiet_with_cst(qp, true);
-        }
-
+#ifdef NVSHMEM_IBGDA_USE_RC_LOOPBACK
+        uint32_t rc_lb = 0;
+#endif
         for (uint32_t i = index_in_scope; i < nrcs; i += scope_size) {
             if (i / (state->num_rc_per_pe * state->num_devices_initialized) ==
                 nvshmemi_device_state_d.mype) {
-                continue;
+#ifdef NVSHMEM_IBGDA_USE_RC_LOOPBACK
+                // Allow loopback transactions
+                if (rc_lb++)
+#else
+                // No loopback to oneself
+#endif
+                    continue;
             }
             qp = &state->globalmem.rcs[i];
             ibgda_quiet_with_cst(qp, true);
@@ -2684,14 +2712,13 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_fence() {
     // We need to quiet those QPs.
     // TODO: Make it more efficient.
     nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
-    uint32_t ndcis = state->num_shared_dcis + state->num_exclusive_dcis;
     uint32_t index_in_scope = nvshmemi_thread_id_in_threadgroup<SCOPE>();
     uint32_t scope_size = nvshmemi_threadgroup_size<SCOPE>();
     uint32_t nrcs = state->num_rc_per_pe * nvshmemi_device_state_d.npes;
     nvshmemi_ibgda_device_qp_t *qp;
 
     // As all WQEs always go to the same QP, FENCE is naturally guaranteed.
-    if (unlikely(ndcis + nrcs <= 1)) return;
+    if (unlikely(nrcs <= 1)) return;
 
     scope_size =
         scope_size > IBGDA_MAX_THREADS_PER_QUIET ? IBGDA_MAX_THREADS_PER_QUIET : scope_size;
@@ -2700,11 +2727,6 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_fence() {
     // It is ok for GET to finish without data arrival.
     // Use ibgda_quiet here instead of ibgda_quiet_with_cst since it is cheaper.
     if (index_in_scope < scope_size) {
-        for (uint32_t i = index_in_scope; i < ndcis; i += scope_size) {
-            qp = &state->globalmem.dcis[i];
-            ibgda_quiet(qp);
-        }
-
         for (uint32_t i = index_in_scope; i < nrcs; i += scope_size) {
             if (i / state->num_rc_per_pe == nvshmemi_device_state_d.mype) continue;
             qp = &state->globalmem.rcs[i];
@@ -2719,19 +2741,19 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void nvshmemi_ibgda_enforce_consistency
     bool use_membar) {
     nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
 
+#ifdef NVSHMEM_IBGDA_USE_RC_LOOPBACK
     if (!state->may_skip_cst) {
-        bool is_dci_shared_among_ctas;
-        // We don't have RC loopback to self.
-        // So, DCI is always used here.
-        nvshmemi_ibgda_device_qp_t *dci;
+        bool is_qp_shared_among_ctas;
+        // Use the RC loopback QP for CST
+        nvshmemi_ibgda_device_qp_t *qp;
 
         /* We must run the cst op on all devices */
         for (int i = 0; i < state->num_devices_initialized; i++) {
-            dci = ibgda_get_dci(nvshmemi_device_state_d.mype, &is_dci_shared_among_ctas);
-            ibgda_cst(dci, is_dci_shared_among_ctas);
+            qp = ibgda_get_qp(nvshmemi_device_state_d.mype, &is_qp_shared_among_ctas);
+            ibgda_cst(qp, is_qp_shared_among_ctas);
         }
     }
-
+#endif
     // TODO: This fence is from the design of Proxy.
     // Review if we still need it when we fully move to IBGDA -- especially for on-stream API.
     if (use_membar) {

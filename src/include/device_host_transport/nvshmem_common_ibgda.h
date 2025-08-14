@@ -31,6 +31,9 @@
         cq.resv_head = NULL;                                         \
         cq.ready_head = NULL;                                        \
         cq.sq_cons_idx = NULL;                                       \
+        cq.cq_phase = NULL;                                          \
+        cq.poll_cq_lock = NULL;                                      \
+        cq.cqe_idx = NULL;                                           \
         cq.cqn = NVSHMEMI_IBGDA_USCALAR_INVALID;                     \
         cq.ncqes = NVSHMEMI_IBGDA_USCALAR_INVALID;                   \
         cq.qpn = NVSHMEMI_IBGDA_USCALAR_INVALID;                     \
@@ -41,6 +44,8 @@
     do {                                                                            \
         qp_man.version = (1 << 16) + sizeof(nvshmemi_ibgda_device_qp_management_t); \
         qp_man.post_send_lock = NVSHMEMI_IBGDA_SCALAR_INVALID;                      \
+        qp_man.resv_lock = NVSHMEMI_IBGDA_SCALAR_INVALID;                           \
+        qp_man.poll_cq_lock = NVSHMEMI_IBGDA_SCALAR_INVALID;                        \
         qp_man.tx_wq.resv_head = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                   \
         qp_man.tx_wq.ready_head = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                  \
         qp_man.tx_wq.prod_idx = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
@@ -48,8 +53,19 @@
         qp_man.tx_wq.sq_cons_idx = 0;                    \
         qp_man.tx_wq.get_head = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
         qp_man.tx_wq.get_tail = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
+        qp_man.tx_wq.resv_prod_slot_idx = 0;                                        \
+        qp_man.tx_wq.ready_prod_slot_idx = 0;                                       \
+        qp_man.tx_wq.posted_prod_slot_idx = 0;                                      \
+        qp_man.tx_wq.epoch = 0;                                                     \
+        qp_man.tx_wq.cq_phase = 1;                                                  \
+        qp_man.tx_wq.cqe_idx = 0;                                                   \
+        qp_man.tx_wq.msn_idx = 0;                                                   \
+        qp_man.tx_wq.psn = 0;                                                       \
         qp_man.rx_wq.resv_head = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
         qp_man.rx_wq.cons_idx = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
+        qp_man.rx_wq.cqe_idx = 0;                                                   \
+        qp_man.rx_wq.cq_phase = 1;                                                  \
+        qp_man.rx_wq.epoch = 0;                                                     \
         qp_man.ibuf.head = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                         \
         qp_man.ibuf.tail = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                         \
     } while (0);
@@ -115,8 +131,6 @@
 #include <cuda/std/climits>
 #endif
 
-#define NVSHMEMI_IBGDA_BNXT_STATIC_WQE_SLOTS   3
-
 #define NVSHMEMI_IBGDA_MIN_QP_DEPTH 128
 #define NVSHMEMI_IBGDA_MAX_QP_DEPTH 32768
 #define NVSHMEMI_IBGDA_IBUF_SLOT_SIZE 256  // 32 threads * sizeof(uint64_t)
@@ -153,13 +167,16 @@ typedef struct {
     uint64_t *sq_cons_idx;
     uint64_t *resv_head;
     uint64_t *ready_head;
+    uint64_t *cq_phase;
+    uint64_t *cqe_idx;
+    int *poll_cq_lock;
     uint32_t cqn;
     uint32_t ncqes;
     uint32_t qpn;
-    /* Validity of the CQE, change phase whenever cons_idx crosses 0 */
-    uint32_t phase;
+    uint32_t sq_size;
+    uint32_t nvshmem_qpn;
 } nvshmemi_ibgda_device_cq_v1;
-static_assert(sizeof(nvshmemi_ibgda_device_cq_v1) == 80, "ibgda_device_cq_v1 must be 80 bytes.");
+static_assert(sizeof(nvshmemi_ibgda_device_cq_v1) == 112, "ibgda_device_cq_v1 must be 108 bytes.");
 
 typedef nvshmemi_ibgda_device_cq_v1 nvshmemi_ibgda_device_cq_t;
 
@@ -168,6 +185,8 @@ typedef nvshmemi_ibgda_device_cq_v1 nvshmemi_ibgda_device_cq_t;
 typedef struct {
     int version;
     int post_send_lock;
+    int resv_lock;
+    int poll_cq_lock;
     struct {
         // All indexes are in wqebb unit
         uint64_t resv_head;   // last reserved wqe idx + 1
@@ -177,10 +196,21 @@ typedef struct {
         uint64_t sq_cons_idx; // HW completed consumer index in slots
         uint64_t get_head;    // last wqe idx + 1 with a "fetch" operation (g, get, amo_fetch)
         uint64_t get_tail;    // last wqe idx + 1 polled with cst; get_tail > get_head is possible
+        uint64_t resv_prod_slot_idx;    // last reserved slot idx + 1, wrapping around sq_depth (variable wqe)
+        uint64_t ready_prod_slot_idx;   // last ready slot + 1, wrapping around sq_depth (variable wqe)
+        uint64_t posted_prod_slot_idx;  // posted slot + 1, wrapping around sq_depth (variable wqe)
+        uint64_t epoch;       // SQ DB EPOCH (LSB used)
+        uint64_t cq_phase;    // CQ Toggle bit(LSB used)
+        uint64_t cqe_idx;     // CQE index in CQ
+        uint64_t msn_idx;     // msn entry of the wqe align with resv_head
+        uint64_t psn;         // start PSN of the wqe align with resv_head
     } tx_wq;
     struct {
         uint64_t resv_head;   // last reserved wqe idx + 1
         uint64_t cons_idx;    // polled wqe idx + 1 (consumer index + 1)
+        uint64_t cqe_idx;     // CQE index in CQ
+        uint64_t cq_phase;    // CQ Toggle bit(LSB used)
+        uint64_t epoch;       // RQ DB EPOCH (LSB used)
     } rx_wq;
     struct {
         uint64_t head;
@@ -188,8 +218,8 @@ typedef struct {
     } ibuf;
     char padding[NVSHMEMI_IBGDA_QP_MANAGEMENT_PADDING];
 } __attribute__((__aligned__(8))) nvshmemi_ibgda_device_qp_management_v1;
-static_assert(sizeof(nvshmemi_ibgda_device_qp_management_v1) == 120,
-              "ibgda_device_qp_management_v1 must be 120 bytes.");
+static_assert(sizeof(nvshmemi_ibgda_device_qp_management_v1) == 216,
+              "ibgda_device_qp_management_v1 must be 216 bytes.");
 
 typedef nvshmemi_ibgda_device_qp_management_v1 nvshmemi_ibgda_device_qp_management_t;
 
@@ -212,6 +242,7 @@ typedef struct nvshmemi_ibgda_device_qp {
         nvshmemi_ibgda_device_cq_t *cq;
         // May point to mvars.prod_idx or internal prod_idx
         uint64_t *prod_idx;
+        uint64_t sq_depth;    // = nwqes * BNXT_RE_STATIC_WQE_SIZE_SLOTS
     } tx_wq;
     struct {
         uint16_t nwqes;
@@ -226,15 +257,13 @@ typedef struct nvshmemi_ibgda_device_qp {
 
     /* MSN table related parameters */
     uint16_t mtu;
-    uint32_t sq_psn;
-    uint32_t msn;
     uint32_t msn_tbl_sz;
     uint32_t *dbtail;
     void *pad;
 
     nvshmemi_ibgda_device_qp_management_v1 mvars;  // management variables
 } nvshmemi_ibgda_device_qp_v1;
-static_assert(sizeof(nvshmemi_ibgda_device_qp_v1) == 296, "ibgda_device_qp_v1 must be 296 bytes.");
+static_assert(sizeof(nvshmemi_ibgda_device_qp_v1) == 392, "ibgda_device_qp_v1 must be 392 bytes.");
 
 typedef nvshmemi_ibgda_device_qp_v1 nvshmemi_ibgda_device_qp_t;
 

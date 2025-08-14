@@ -300,7 +300,7 @@ static int ep_create(nvshmem_transport_t t, struct ibrc_ep **ep_ptr, int devid,
     memset((void *)ep, 0, sizeof(struct ibrc_ep));
 
     if (!device->send_cq) {
-        device->send_cq = ftable.create_cq(context, device->device_attr.max_cqe, NULL, NULL, 0);
+        device->send_cq = ftable.create_cq(context, ibrc_qp_depth, NULL, NULL, 0);
         NVSHMEMI_NULL_ERROR_JMP(device->send_cq, status, NVSHMEMX_ERROR_INTERNAL, out,
                                 "cq creation failed \n");
     }

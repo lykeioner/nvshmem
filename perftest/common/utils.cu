@@ -545,7 +545,7 @@ void print_table_v1(const char *job_name, const char *subjob_name, const char *v
 
     } else {
         // recombine first two tokens of subjob_name
-        char type[strlen(subjob_name)];
+        char type[strlen(subjob_name) + 1];
         strcpy(type, subjob_name);
         char *last_delim = strrchr(type, '-');
         if (last_delim != NULL) *last_delim = '\0';
